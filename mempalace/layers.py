@@ -101,27 +101,19 @@ class Layer1:
         except Exception:
             return "## L1 — No palace found. Run: mempalace mine <dir>"
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
-        _BATCH = 500
-        docs, metas = [], []
-        offset = 0
-        while True:
-            kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
+        # Single-pass fetch (pattern from #2153 CLI status fast path):
+        # On Qdrant backends, col.get(offset=N) materializes the whole collection
+        # via _scroll_all() on each call, turning O(n) into O(n²). One get() call
+        # with limit=MAX_SCAN avoids this entirely while still respecting the cap.
+        try:
+            kwargs = {"include": ["documents", "metadatas"], "limit": self.MAX_SCAN}
             if self.wing:
                 kwargs["where"] = {"wing": self.wing}
-            try:
-                batch = col.get(**kwargs)
-            except Exception:
-                break
-            batch_docs = batch.get("documents", [])
-            batch_metas = batch.get("metadatas", [])
-            if not batch_docs:
-                break
-            docs.extend(batch_docs)
-            metas.extend(batch_metas)
-            offset += len(batch_docs)
-            if len(batch_docs) < _BATCH or len(docs) >= self.MAX_SCAN:
-                break
+            result = col.get(**kwargs)
+            docs = result.get("documents", [])
+            metas = result.get("metadatas", [])
+        except Exception:
+            docs, metas = [], []
 
         if not docs:
             return "## L1 — No memories yet."
