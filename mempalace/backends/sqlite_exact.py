@@ -464,8 +464,10 @@ class _SQLiteExactHandle:
         # collection_id -> (ids, float32 matrix, mini-metadata). Filled lazily
         # by query() so a long-lived hub does not re-read every embedding blob
         # on the next search. Mini-metadata is wing/room/source_file for
-        # in-memory equality filters. Cleared on any write.
+        # in-memory equality filters. Cleared on any write through this handle;
+        # ``_vector_cache_data_version`` detects commits from other handles.
         self._vector_cache: dict[int, tuple[list[str], np.ndarray, list[dict]]] = {}
+        self._vector_cache_data_version: Optional[int] = None
 
 
 class SQLiteExactCollection(BaseCollection):
@@ -958,6 +960,10 @@ class SQLiteExactCollection(BaseCollection):
         _validate_where(where_document)
         expected = self._collection_dimension(cur, collection_id)
         empty = np.zeros((0, expected or 0), dtype=np.float32)
+        data_version = int(cur.execute("PRAGMA data_version").fetchone()[0])
+        if self._handle._vector_cache_data_version != data_version:
+            self._handle._vector_cache.clear()
+            self._handle._vector_cache_data_version = data_version
         cached = self._handle._vector_cache.get(collection_id)
         if cached is None:
             cached = self._load_all_vectors(cur, collection_id, expected)
@@ -1054,11 +1060,25 @@ class SQLiteExactCollection(BaseCollection):
     ) -> GetResult:
         spec = _IncludeSpec.resolve(include, default_distances=False)
         # get(ids=...) must not scan the collection: look up by primary key.
-        if ids is not None and where is None and where_document is None:
+        if ids is not None:
+            _validate_where(where)
+            _validate_where(where_document)
+            lookup_spec = _IncludeSpec(
+                documents=spec.documents or bool(where_document),
+                metadatas=spec.metadatas or bool(where),
+                distances=False,
+                embeddings=spec.embeddings,
+            )
             with self._cursor() as cur:
                 collection_id = self._collection_id(cur)
-                by_id = self._rows_by_ids(cur, collection_id, list(ids), spec)
-            rows = [by_id[doc_id] for doc_id in ids if doc_id in by_id]
+                by_id = self._rows_by_ids(cur, collection_id, list(ids), lookup_spec)
+            rows = [
+                by_id[doc_id]
+                for doc_id in ids
+                if doc_id in by_id
+                and _matches_where(by_id[doc_id]["metadata"], where)
+                and _matches_where_document(by_id[doc_id]["document"], where_document)
+            ]
             if offset:
                 rows = rows[offset:]
             if limit is not None:

@@ -163,7 +163,7 @@ can treat process exit as "you have mail":
 ```bash
 mempalace logstream watch \
   --agent mac-claude \
-  --type task.request --type patch.ready \
+  --type task.request --type task.reply --type patch.ready \
   --state-file ~/.mempalace/watch/mac-claude.json --json
 ```
 
@@ -172,7 +172,9 @@ exclusion matters more than it looks: `to_agent=<you>` also matches `*`
 broadcasts, and your own broadcasts are broadcasts, so a watcher without it
 wakes itself on every status it posts. Repeating a filter means "or", which is
 how you narrow to the events that genuinely require you and stop being woken by
-routine traffic. Exit is `0` on a match and `2` on `--idle-exit-ms`, matching
+routine traffic — but keep `task.reply` in the set if you ever delegate:
+`blocked` and `failed` arrive as replies, and a watcher that rejects one
+advances its cursor past it silently. Exit is `0` on a match and `2` on `--idle-exit-ms`, matching
 `wait`'s timeout convention; `--follow` keeps the process alive past the first
 match for daemons. A cursorless first run starts at the tip, like the SSE
 live-tail, and says so on stderr — replaying a long fleet log would wake a new
@@ -193,7 +195,10 @@ post a `status` event to `to_agent=*` when you begin monitoring a correlation,
 naming four things: the filter you are watching, the cursor you have reached,
 the work that must not be duplicated, and — implicitly — the fact that someone
 is home. Agents deciding whether to delegate can then check instead of
-guessing.
+guessing. Announce in a `status` type the fleet's watchers sleep
+through, once per session and again when your filter changes — an
+announcement typed as something watchers wake
+on wakes every window, every time anyone re-arms.
 
 The inverse is equally important. If your harness is turn-based and stops
 existing between prompts, declare that rather than staying quiet: publish your

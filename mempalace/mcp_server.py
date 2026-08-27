@@ -94,6 +94,7 @@ from .palace_graph import (  # noqa: E402
     list_tunnels,
     delete_tunnel,
     follow_tunnels,
+    _load_tunnels as _load_graph_tunnels,
 )
 from .hallways import (  # noqa: E402
     list_hallways,
@@ -352,6 +353,13 @@ _last_request_time: float = time.monotonic()
 _sqlite_integrity_checked = False
 _sqlite_integrity_errors: list[str] = []
 _sqlite_integrity_check_error = ""
+# Why no verdict exists, when none does. An empty _sqlite_integrity_errors is
+# ambiguous on its own: quick_check found nothing wrong, or it never ran. Four
+# exits in the refresh leave the list empty and only one of them means the
+# database came back clean. This names one of the others, the palace with no
+# chroma.sqlite3, so the status payload can report an absence rather than a
+# clean bill of health.
+_sqlite_integrity_no_verdict_reason = ""
 # Serializes quick_check runs between the async startup preflight thread and
 # lazy consumers on the protocol thread (double-checked in
 # _ensure_sqlite_integrity_status) so the O(database size) probe never runs
@@ -837,10 +845,11 @@ def _startup_integrity_size_limit_bytes() -> int:
 def _refresh_sqlite_integrity_status() -> None:
     """Refresh the MCP startup SQLite/FTS5 integrity gate.
 
-    Uses repair.sqlite_integrity_errors(), which is read-only and already backs
-    repair preflight. A failure here is treated as an integrity failure so the
-    server does not proceed silently after a malformed FTS5 index or other
-    SQLite-layer corruption (#1818).
+    Uses repair.sqlite_integrity_status(), which wraps the read-only
+    quick_check backing repair preflight and adds whether a verdict exists at
+    all. A failure here is treated as an integrity failure so the server does
+    not proceed silently after a malformed FTS5 index or other SQLite-layer
+    corruption (#1818).
     """
 
     with _sqlite_integrity_refresh_lock:
@@ -852,11 +861,13 @@ def _refresh_sqlite_integrity_status_locked() -> None:
     global _sqlite_integrity_checked
     global _sqlite_integrity_errors
     global _sqlite_integrity_check_error
+    global _sqlite_integrity_no_verdict_reason
 
     if not _config.palace_path or not _is_chroma_backend():
         _sqlite_integrity_checked = True
         _sqlite_integrity_errors = []
         _sqlite_integrity_check_error = ""
+        _sqlite_integrity_no_verdict_reason = ""
         return
 
     max_bytes = _startup_integrity_size_limit_bytes()
@@ -870,6 +881,12 @@ def _refresh_sqlite_integrity_status_locked() -> None:
             _sqlite_integrity_checked = True
             _sqlite_integrity_errors = []
             _sqlite_integrity_check_error = ""
+            # This exit is its own kind of "no verdict" and does not yet name
+            # itself (#2240). It must at least not inherit the previous
+            # probe's reason: a palace that had no database when the server
+            # started, and has an oversized one now, would otherwise be
+            # described as having no database at all.
+            _sqlite_integrity_no_verdict_reason = ""
             logger.warning(
                 "SQLite startup integrity check skipped: %s is %.0f MB "
                 "(> %.0f MB limit); PRAGMA quick_check would block MCP "
@@ -883,16 +900,36 @@ def _refresh_sqlite_integrity_status_locked() -> None:
             return
 
     try:
-        from .repair import sqlite_integrity_errors
+        from .repair import sqlite_integrity_status
 
-        errors = sqlite_integrity_errors(_config.palace_path)
+        status = sqlite_integrity_status(_config.palace_path)
     except Exception as exc:
         _sqlite_integrity_check_error = (
             f"sqlite integrity probe failed: {type(exc).__name__}: {exc}"
         )
         _sqlite_integrity_errors = [_sqlite_integrity_check_error]
+        _sqlite_integrity_no_verdict_reason = ""
     else:
-        _sqlite_integrity_errors = [str(error) for error in errors if str(error)]
+        fresh_errors = [str(error) for error in status.errors if str(error)]
+        # _sqlite_integrity_payload reads these globals without the lock, so
+        # the order within each branch is chosen to keep that branch's own
+        # window on the safer side: entering "no verdict" records the reason
+        # before the list it explains, and leaving it clears the reason only
+        # once the fresh errors are in place.
+        #
+        # No write order makes the payload safe, and this one does not claim
+        # to. That reader loads the error list more than once, so a refresh
+        # landing between two of its loads can still publish `ok: true` for a
+        # palace with no database. The way to close that is to publish the
+        # verdict as one value, which is a change to what this gate stores
+        # rather than to
+        # the order it stores it in.
+        if status.checked:
+            _sqlite_integrity_errors = fresh_errors
+            _sqlite_integrity_no_verdict_reason = ""
+        else:
+            _sqlite_integrity_no_verdict_reason = status.reason
+            _sqlite_integrity_errors = fresh_errors
         _sqlite_integrity_check_error = ""
 
     _sqlite_integrity_checked = True
@@ -919,6 +956,20 @@ def _ensure_sqlite_integrity_status() -> None:
 def _sqlite_integrity_payload() -> dict:
     _ensure_sqlite_integrity_status()
 
+    # These globals are read one at a time, without the refresh lock, as they
+    # have always been, and a refresh landing between two of those reads can
+    # make this function publish a verdict the gate never held. Both directions
+    # produce one: reading through, as here, can answer `ok: true` for a palace
+    # with no database, because the error list the branch below tests is read
+    # again when the payload is built; snapshotting into locals first can answer
+    # `ok: true` for a palace whose corruption the refresh had just found,
+    # because separate loads stay separate moments either way. A snapshot
+    # therefore trades one window for another of the same class rather than
+    # closing anything, which is why it is not taken here. Holding the refresh
+    # lock across this function would close it, at the cost of serialising every
+    # status read behind an O(database size) probe; publishing the verdict as
+    # one value closes it without that, and is the change worth making.
+    #
     # The integrity gate only knows how to check chroma.sqlite3, and
     # _refresh_sqlite_integrity_status short-circuits for non-chroma backends,
     # so on a non-chroma backend no quick_check runs. Reporting checked/ok true
@@ -945,6 +996,24 @@ def _sqlite_integrity_payload() -> dict:
                     "chroma.sqlite3 integrity check does not run for backend "
                     f"{backend_name or 'unknown'!r}"
                 ),
+            }
+        # Same shape, second way this payload reports an absent verdict: the
+        # backend is chroma, but there was no database to open. Reporting
+        # checked/ok true here would claim a quick_check that never ran. A
+        # palace whose file is unreachable rather than absent does not arrive
+        # here at all: its probe recorded an error, so it falls through to the
+        # verdict payload below with `ok: false`.
+        if _sqlite_integrity_no_verdict_reason:
+            return {
+                "checked": False,
+                "ok": None,
+                "palace": _config.palace_path or "",
+                "sqlite_path": os.path.join(_config.palace_path, "chroma.sqlite3")
+                if _config.palace_path
+                else "",
+                "error_count": 0,
+                "errors": [],
+                "reason": _sqlite_integrity_no_verdict_reason,
             }
 
     payload = {
@@ -1980,7 +2049,7 @@ def _sqlite_graph_stats():
     (non-chroma backend, missing/unbootstrapped palace, sqlite error). The
     reconstruction mirrors ``palace_graph.build_graph`` /
     ``palace_graph.graph_stats`` exactly: a node is a room with a non-empty
-    wing and a usable room name (the catch-all ``"general"`` is excluded), and
+    wing and a usable room name (including the catch-all ``"general"``), and
     edges are the per-hall cross-wing crossings of multi-wing rooms.
     """
     rows = None
@@ -2006,25 +2075,30 @@ def _sqlite_graph_stats():
 
 
 def _graph_stats_from_grouped_rows(rows):
-    """Rebuild ``graph_stats`` from ``(room, wing, hall, n)`` grouped rows.
+    """Rebuild ``graph_stats`` from grouped sqlite metadata rows.
 
-    Backends may append a fifth ``last_date`` column for ``find_tunnels``;
-    stats do not use it, so extra columns are ignored rather than unpacked.
+    Rows are ``(room, wing, hall, n)`` with an optional fifth ``last_date``
+    column. Because grouping includes ``hall``, one room placement can occupy
+    multiple SQL rows; room instances therefore use a distinct ``(wing, room)`` set.
     """
     from collections import Counter, defaultdict
 
     room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0})
+    room_instances = set()
     for row in rows:
         room, wing, hall, n = row[0], row[1], row[2], row[3]
-        if not room or room == "general" or not wing:
+        if not room or not wing:
             continue
-        node = room_data[room]
-        node["wings"].add(str(wing))
+        room_key = str(room)
+        wing_key = str(wing)
+        room_instances.add((wing_key, room_key))
+        node = room_data[room_key]
+        node["wings"].add(wing_key)
         if hall:
             node["halls"].add(str(hall))
         node["count"] += int(n)
 
-    tunnel_rooms = 0
+    passive_tunnel_rooms = 0
     total_edges = 0
     wing_counts = Counter()
     for data in room_data.values():
@@ -2032,20 +2106,25 @@ def _graph_stats_from_grouped_rows(rows):
         for wing in data["wings"]:
             wing_counts[wing] += 1
         if n_wings >= 2:
-            tunnel_rooms += 1
+            passive_tunnel_rooms += 1
             total_edges += (n_wings * (n_wings - 1) // 2) * len(data["halls"])
 
     top_tunnels = [
         {"room": room, "wings": sorted(data["wings"]), "count": data["count"]}
-        for room, data in sorted(room_data.items(), key=lambda kv: (-len(kv[1]["wings"]), kv[0]))[
-            :10
-        ]
+        for room, data in sorted(
+            room_data.items(), key=lambda item: (-len(item[1]["wings"]), item[0])
+        )[:10]
         if len(data["wings"]) >= 2
     ]
+    explicit_tunnel_count = len(_load_graph_tunnels(_config))
     return {
         "total_rooms": len(room_data),
-        "tunnel_rooms": tunnel_rooms,
+        "total_room_instances": len(room_instances),
+        "tunnel_rooms": passive_tunnel_rooms,
+        "passive_tunnel_rooms": passive_tunnel_rooms,
+        "explicit_tunnels": explicit_tunnel_count,
         "total_edges": total_edges,
+        "total_connections": total_edges + explicit_tunnel_count,
         "rooms_per_wing": dict(wing_counts.most_common()),
         "top_tunnels": top_tunnels,
     }
@@ -2377,6 +2456,7 @@ def tool_search(
     max_distance: float = 1.5,
     min_similarity: float = None,
     context: str = None,
+    candidate_strategy: str = "vector",
 ):
     limit = max(1, min(limit, _MAX_RESULTS))
     try:
@@ -2387,6 +2467,9 @@ def tool_search(
         return {"error": str(e)}
     # since/before are validated inside search_memories (shared
     # parse_window), which returns the same {"error": ...} shape.
+    candidate_strategy = candidate_strategy or "vector"
+    if not isinstance(candidate_strategy, str) or candidate_strategy not in {"vector", "union"}:
+        return {"error": "candidate_strategy must be one of ('vector', 'union')"}
     # Backwards compat: accept old name
     # Backwards compat: convert old similarity scale (higher=stricter) to
     # distance scale (lower=stricter). Similarity 0.8 → distance 0.2.
@@ -2409,6 +2492,7 @@ def tool_search(
         n_results=limit,
         max_distance=dist,
         vector_disabled=_vector_disabled,
+        candidate_strategy=candidate_strategy,
         collection_name=_config.collection_name,
     )
     if _is_transient_index_error(result):
@@ -2429,6 +2513,7 @@ def tool_search(
             n_results=limit,
             max_distance=dist,
             vector_disabled=_vector_disabled,
+            candidate_strategy=candidate_strategy,
             collection_name=_config.collection_name,
         )
         if not _is_transient_index_error(result):
@@ -3150,13 +3235,24 @@ def tool_delete_drawer(drawer_id: str):
         col.delete(ids=record["ids"])
         _invalidate_overview_caches()
 
-        logger.info("Deleted drawer: %s (%s rows)", drawer_id, len(record["ids"]))
+        # Closets are keyed by source_file, not drawer_id (#1722), so a
+        # drawer-only delete strands a closet quoting the now-deleted text (#2325).
+        source_file = record["metadata"].get("source_file")
+        closets_deleted = _purge_source_closets(source_file, commit=True) if source_file else 0
+
+        logger.info(
+            "Deleted drawer: %s (%s rows, %s closet(s) purged)",
+            drawer_id,
+            len(record["ids"]),
+            closets_deleted,
+        )
 
         return {
             "success": True,
             "drawer_id": drawer_id,
             "deleted_ids": record["ids"],
             "chunks_deleted": len(record["ids"]),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -3765,6 +3861,13 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             },
         )
 
+        # A closet quotes the source file, not the stored drawer, so it only
+        # goes stale on a content change; wing/room alone leaves it correct (#2325).
+        closets_deleted = 0
+        source_file = old_meta.get("source_file")
+        if content is not None and source_file:
+            closets_deleted = _purge_source_closets(source_file, commit=True)
+
         chunk_size = max(1, int(getattr(_config, "chunk_size", 800) or 800))
         should_chunk = bool(record.get("chunked")) or len(new_doc) > chunk_size
 
@@ -3794,6 +3897,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
                 "room": new_meta.get("room", ""),
                 "chunks": len(chunk_ids),
                 "chunk_ids": chunk_ids,
+                "closets_deleted": closets_deleted,
             }
 
         update_kwargs = {"ids": [record["ids"][0]]}
@@ -3811,6 +3915,7 @@ def tool_update_drawer(drawer_id: str, content: str = None, wing: str = None, ro
             "drawer_id": drawer_id,
             "wing": new_meta.get("wing", ""),
             "room": new_meta.get("room", ""),
+            "closets_deleted": closets_deleted,
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -4294,6 +4399,31 @@ def tool_memories_filed_away():
 # ==================== SETTINGS TOOLS ====================
 
 
+def _attach_stale_library_warning(result: dict) -> dict:
+    """Stamp the stale-library write-guard state onto a reconnect result.
+
+    Reconnect reopens the database but cannot reload Python modules, so it
+    never clears the stale-library gate (#899). Without this, a reconnect
+    after an upgrade answers "success: Reconnected to palace" while every
+    write keeps failing — the caller has no way to tell the two states
+    apart from the reconnect result alone.
+    """
+    payload = _stale_library_payload()
+    if payload.get("stale") and "gate_disabled_by" not in payload:
+        described = ", ".join(
+            f"{entry['package']} {entry['serving']} -> {entry['installed']}"
+            for entry in payload.get("packages", [])
+        )
+        result["library_versions"] = payload
+        result["restart_required"] = True
+        result["warning"] = (
+            f"Reconnected, but this server is still running superseded code ({described}); "
+            "writes stay refused until the MCP server (or the host application that "
+            "spawned it) is restarted — reconnect cannot reload Python modules."
+        )
+    return result
+
+
 def tool_reconnect():
     """Force the MCP server to drop cached ChromaDB + KnowledgeGraph state.
 
@@ -4431,21 +4561,25 @@ def tool_reconnect():
                 result["error"] = "; ".join(close_errors)
             return result
         if close_errors:
-            return {
-                "success": False,
-                "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+            return _attach_stale_library_warning(
+                {
+                    "success": False,
+                    "message": "Reconnect reopened the palace but failed to fully reset cached handles",
+                    "drawers": col.count(),
+                    "vector_disabled": _vector_disabled,
+                    "vector_disabled_reason": _vector_disabled_reason,
+                    "error": "; ".join(close_errors),
+                }
+            )
+        return _attach_stale_library_warning(
+            {
+                "success": True,
+                "message": "Reconnected to palace",
                 "drawers": col.count(),
                 "vector_disabled": _vector_disabled,
                 "vector_disabled_reason": _vector_disabled_reason,
-                "error": "; ".join(close_errors),
             }
-        return {
-            "success": True,
-            "message": "Reconnected to palace",
-            "drawers": col.count(),
-            "vector_disabled": _vector_disabled,
-            "vector_disabled_reason": _vector_disabled_reason,
-        }
+        )
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -5075,6 +5209,11 @@ TOOLS = {
                 "max_distance": {
                     "type": "number",
                     "description": "Max cosine distance threshold (0=identical, 2=opposite). Results further than this are dropped. Lower = stricter. Default 1.5. Set to 0 to disable.",
+                },
+                "candidate_strategy": {
+                    "type": "string",
+                    "enum": ["vector", "union"],
+                    "description": "Candidate source strategy. 'vector' preserves default semantic search; 'union' also merges backend BM25 lexical candidates before reranking.",
                 },
                 "context": {
                     "type": "string",
@@ -6278,9 +6417,15 @@ def _mcp_stale_library_refusal(req_id, tool_name: str):
         "id": req_id,
         "error": {
             "code": _STALE_LIBRARY_ERROR_CODE,
+            # The remedy rides in the message itself, not only in data.hint:
+            # several MCP clients surface only the top-level message of an
+            # error, so a hint-only remedy never reaches the model that has
+            # to act on it.
             "message": (
                 "Server is running a library version that is no longer installed "
-                f"({described}); refusing writes until it is restarted"
+                f"({described}); refusing writes until it is restarted. Restart the "
+                "MCP server (or the host application that spawned it) to pick up the "
+                "installed version — mempalace_reconnect cannot clear this"
             ),
             "data": {
                 "tool": tool_name,
@@ -7089,7 +7234,12 @@ def _http_status_payload(httpd) -> dict:
         os.path.abspath(os.path.expanduser(_config.palace_path)) if _config.palace_path else ""
     )
     return {
-        "ok": bool(integrity.get("ok")),
+        # `ok` is None in the two cases the payload reports as an absent
+        # verdict: a non-chroma backend (#1931), and a chroma palace with no
+        # database file yet. That is an absence, not a failure, and collapsing
+        # it with bool() would report a freshly installed server as unhealthy.
+        # A missing key is not one of those cases and still fails closed.
+        "ok": integrity.get("ok", False) is not False,
         "server": {
             "name": "mempalace",
             "version": __version__,

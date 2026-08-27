@@ -1138,6 +1138,7 @@ def cmd_sync(args):
     print(f"  Kept:           {report['kept']}")
     print(f"  Gitignored:     {report['gitignored']}  {removed_suffix}")
     print(f"  Missing:        {report['missing']}  {removed_suffix}")
+    print(f"  Unresolved:     {report['unresolved']}  (kept)")
     print(f"  No source:      {report['no_source']}  (kept)")
     print(f"  Out of scope:   {report['out_of_scope']}  (kept)")
 
@@ -1148,6 +1149,17 @@ def cmd_sync(args):
         print(f"\n  {label}:")
         for src, n in top:
             print(f"    {src}  ({n})")
+
+    if report["unresolved"]:
+        print("\n  Unresolved drawers are kept: nothing here could show their source file is gone.")
+        unresolved_sources = report.get("unresolved_by_source") or {}
+        if unresolved_sources:
+            top = sorted(unresolved_sources.items(), key=lambda kv: -kv[1])[:5]
+            for src, n in top:
+                print(f"    {src}  ({n})")
+            rest = len(unresolved_sources) - len(top)
+            if rest:
+                print(f"    and {rest} more source file(s)")
 
     if args.dry_run:
         if report["gitignored"] + report["missing"] > 0:
@@ -2319,6 +2331,13 @@ def cmd_instructions(args):
     run_instructions(name=args.name)
 
 
+def cmd_rules(args):
+    """Output the shared-brain agent rules block for a given agent identity."""
+    from .instructions_cli import run_rules
+
+    run_rules(agent_id=args.agent)
+
+
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "mempalace-mcp"
@@ -3022,6 +3041,20 @@ def main():
     for instr_name in ["init", "search", "mine", "help", "status"]:
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
+    # rules
+    p_rules = sub.add_parser(
+        "rules",
+        help=(
+            "Output the canonical shared-brain agent rules block for a system "
+            "prompt (CLAUDE.md, GEMINI.md, AGENTS.md, ...)"
+        ),
+    )
+    p_rules.add_argument(
+        "--agent",
+        required=True,
+        help="Stable agent identity to render into the rules, e.g. mac-claude",
+    )
+
     # repair
     p_repair = sub.add_parser(
         "repair",
@@ -3492,6 +3525,7 @@ def main():
 
     dispatch = {
         "init": cmd_init,
+        "rules": cmd_rules,
         "mine": cmd_mine,
         "split": cmd_split,
         "search": cmd_search,
