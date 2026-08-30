@@ -8,7 +8,7 @@ tasks:
       - "git merge upstream/develop --no-edit || (git merge --abort && exit 1)"
 
   install:
-    desc: Install mempalace using mise Python 3.13 and verify version
+    desc: Sync deps + install mempalace into mise Python 3.13, verify version
     sources:
       - mempalace/**/*.py
       - pyproject.toml
@@ -16,6 +16,8 @@ tasks:
       PYTHON: >-
         /Users/reevonr/.local/share/mise/installs/python/3.13/bin/python3.13
     cmds:
+      # Pull any deps added by upstream merges (fast no-op when current)
+      - "uv pip install --python {{.PYTHON}} -r pyproject.toml"
       - >-
         uv pip install --python {{.PYTHON}} --force-reinstall --no-deps
         {{.ROOT_DIR}}
