@@ -3,8 +3,6 @@ version: "3"
 tasks:
   sync-upstream:
     desc: Fetch and merge changes from upstream/develop branch (no push)
-    sources:
-      - .git
     cmds:
       - git fetch upstream --prune
       - "git merge upstream/develop --no-edit || (git merge --abort && exit 1)"
@@ -15,7 +13,10 @@ tasks:
       - mempalace/**/*.py
       - pyproject.toml
     vars:
-      PYTHON: /Users/reevonr/.local/share/mise/installs/python/3.13/bin/python3.13
+      PYTHON: >-
+        /Users/reevonr/.local/share/mise/installs/python/3.13/bin/python3.13
     cmds:
-      - "uv pip install --python {{.PYTHON}} --force-reinstall --no-deps {{.ROOT_DIR}}"
+      - >-
+        uv pip install --python {{.PYTHON}} --force-reinstall --no-deps
+        {{.ROOT_DIR}}
       - "{{.PYTHON}} -m mempalace --version"
