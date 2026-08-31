@@ -29,6 +29,16 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# Backend selection must come from the tests themselves, never the shell.
+# A developer exporting MEMPALACE_BACKEND (or MEMPALACE_BACKEND_EXPLICIT) for
+# their own palace would otherwise route every test mine through a non-chroma
+# backend, leaving tests that open a raw chromadb.PersistentClient unable to
+# find the collection. Tests that exercise env-driven selection set/del these
+# vars themselves (monkeypatch) after this point.
+for _var in ("MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT"):
+    _original_env[_var] = os.environ.get(_var)
+    os.environ.pop(_var, None)
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
@@ -179,14 +189,19 @@ def _reset_mcp_cache():
                             close()
                         except Exception:
                             pass
-                mcp_server._client_cache = None
-                mcp_server._collection_cache = None
-                if hasattr(mcp_server, "_collection_cache_backend"):
-                    mcp_server._collection_cache_backend = None
-                if hasattr(mcp_server, "_collection_cache_palace"):
-                    mcp_server._collection_cache_palace = None
-                if hasattr(mcp_server, "_collection_open_error"):
-                    mcp_server._collection_open_error = None
+                # setattr (not attribute assignment): mcp_server is a module
+                # object fetched from sys.modules and these cache attrs are
+                # created lazily by mcp_server itself, so a static type checker
+                # cannot see them. setattr keeps that dynamism explicit.
+                for _attr in (
+                    "_client_cache",
+                    "_collection_cache",
+                    "_collection_cache_backend",
+                    "_collection_cache_palace",
+                    "_collection_open_error",
+                ):
+                    if hasattr(mcp_server, _attr):
+                        setattr(mcp_server, _attr, None)
         except AttributeError:
             pass
 
@@ -216,11 +231,12 @@ def _reset_mcp_cache():
             from mempalace import palace as _palace
 
             backend = getattr(_palace, "_DEFAULT_BACKEND", None)
+            close_palace = getattr(backend, "close_palace", None)
             clients = getattr(backend, "_clients", None)
-            if clients:
+            if callable(close_palace) and clients:
                 for path in list(clients):
                     try:
-                        backend.close_palace(path)
+                        close_palace(path)
                     except Exception:
                         pass
         except (ImportError, AttributeError):
@@ -235,9 +251,10 @@ def _reset_mcp_cache():
 def _isolate_home():
     """Ensure HOME points to a temp dir for the entire test session.
 
-    The env vars were already set at module level (above) so that
-    module-level initialisations are captured.  This fixture simply
-    restores the originals on teardown and cleans up the temp dir.
+    The env vars were already set (and the backend-selection vars popped)
+    at module level (above) so that module-level initialisations are
+    captured.  This fixture simply restores the originals on teardown and
+    cleans up the temp dir.
     """
     yield
     for var, orig in _original_env.items():
@@ -286,8 +303,11 @@ def collection(palace_path):
     # close() (not a bare dereference) releases chromadb's rust-side SQLite/HNSW
     # file handles. On Windows a mere `del` leaves them locked, so the temp
     # palace cannot be removed and handles leak across the whole test session
-    # until a later test's HNSW write fails (#1128 Windows CI).
-    client.close()
+    # until a later test's HNSW write fails (#1128 Windows CI). Looked up via
+    # getattr because chromadb's ClientAPI stubs do not declare close().
+    _close = getattr(client, "close", None)
+    if callable(_close):
+        _close()
 
 
 @pytest.fixture
