@@ -29,14 +29,19 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
-# Backend selection must come from the tests themselves, never the shell.
-# A developer exporting MEMPALACE_BACKEND (or MEMPALACE_BACKEND_EXPLICIT) for
-# their own palace would otherwise route every test mine through a non-chroma
-# backend, leaving tests that open a raw chromadb.PersistentClient unable to
-# find the collection. Tests that exercise env-driven selection set/del these
-# vars themselves (monkeypatch) after this point.
-for _var in ("MEMPALACE_BACKEND", "MEMPALACE_BACKEND_EXPLICIT"):
-    _original_env[_var] = os.environ.get(_var)
+# Backend selection and palace targeting must come from the tests themselves,
+# never the shell. ANY developer-exported MEMPALACE_* var would otherwise leak
+# into the suite: MEMPALACE_BACKEND / MEMPALACE_BACKEND_EXPLICIT route every
+# test mine through a non-chroma backend, leaving tests that open a raw
+# chromadb.PersistentClient unable to find the collection, and
+# MEMPALACE_PALACE_PATH / MEMPALACE_QDRANT_NAMESPACE could redirect
+# default-palace lookups at the user's real palace. Scrub every MEMPALACE_*
+# var unconditionally — this is the single centralized choke point. Tests that
+# exercise env-driven selection set/del specific vars themselves (monkeypatch)
+# after this point, which is unaffected by this scrub; the session-finish
+# fixture below restores the originals from _original_env.
+for _var in [k for k in list(os.environ) if k.startswith("MEMPALACE_")]:
+    _original_env[_var] = os.environ[_var]
     os.environ.pop(_var, None)
 
 # Now it is safe to import mempalace modules that trigger initialisation.
