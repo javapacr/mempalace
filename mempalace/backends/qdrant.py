@@ -54,12 +54,16 @@ _PAYLOAD_ID = "mempalace_id"
 _PAYLOAD_DOCUMENT = "document"
 _PAYLOAD_METADATA = "metadata"
 
-# Payload fields filtered on hot per-file operations (project-mine skip
-# checks, in-lock rechecks, stale-drawer purges). Without an index qdrant
-# full-scans the collection for every filtered query. Field paths mirror
-# _condition()'s f"{_PAYLOAD_METADATA}.{field}" keys.
+# Payload fields filtered on hot operations (project-mine skip checks,
+# in-lock rechecks, stale-drawer purges) and on facet listings (wing/room
+# counts: without an index each facet call scans server-side -- ~50 scans
+# per status on a ~50-wing collection; with them facets are ms). Without
+# an index qdrant full-scans the collection for every filtered query.
+# Field paths mirror _condition()'s f"{_PAYLOAD_METADATA}.{field}" keys.
 _FILTER_INDEX_FIELDS: tuple[tuple[str, str], ...] = (
     (f"{_PAYLOAD_METADATA}.source_file", "keyword"),
+    (f"{_PAYLOAD_METADATA}.wing", "keyword"),
+    (f"{_PAYLOAD_METADATA}.room", "keyword"),
 )
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 _TOKEN_RE = re.compile(r"\w{2,}", re.UNICODE)
@@ -766,6 +770,11 @@ class QdrantCollection(BaseCollection):
         existing collection. Index builds run asynchronously server-side,
         so this never blocks the caller, and any failure degrades to
         today's unindexed scans with a warning -- never a failed mine.
+
+        Post-adoption, a ``grey`` collection status is NORMAL, not a fault:
+        grey is a latch, not an error state -- reads, filters, and facet
+        listings all work while grey, and it clears on the next
+        write-driven optimizer tick (BRD P1 evidence E6, observed live).
         """
         if self._filter_indexes_checked:
             return

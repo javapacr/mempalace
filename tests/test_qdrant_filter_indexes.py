@@ -69,6 +69,9 @@ from mempalace.backends.qdrant import (  # noqa: E402
 
 
 SOURCE_INDEX_FIELD = f"{qdrant_mod._PAYLOAD_METADATA}.source_file"
+WING_INDEX_FIELD = f"{qdrant_mod._PAYLOAD_METADATA}.wing"
+ROOM_INDEX_FIELD = f"{qdrant_mod._PAYLOAD_METADATA}.room"
+ALL_INDEX_FIELDS = [SOURCE_INDEX_FIELD, WING_INDEX_FIELD, ROOM_INDEX_FIELD]
 
 
 def _make_qdrant_collection(scroll_pages, marker_exists=True):
@@ -131,15 +134,29 @@ class TestFilterIndexOncePerCollection:
 
     def test_present_index_issues_zero_creation_calls(self):
         """Steady state (every later open, any host): the listing already
-        shows the index, so ZERO create calls are ever issued."""
+        shows every ensured index, so ZERO create calls are ever issued."""
         page = ([_fake_point("d0")], None)
         col, client = _make_qdrant_collection([page])
-        client.list_payload_indexes.return_value = [SOURCE_INDEX_FIELD, "document"]
+        client.list_payload_indexes.return_value = ["document", *ALL_INDEX_FIELDS]
 
         col.get_all_metadata()
         col.get_all_metadata()
 
         client.create_payload_index.assert_not_called()
+
+    def test_wing_room_indexes_adopted_alongside_source_file(self):
+        """Adoption covers every _FILTER_INDEX_FIELDS entry (source_file,
+        wing, room -- all keyword): absent server-side, all created on the
+        first open, none re-created after."""
+        page = ([_fake_point("d0")], None)
+        col, client = _make_qdrant_collection([page])
+        client.list_payload_indexes.return_value = []
+
+        col.get_all_metadata()
+
+        assert _index_creates(client) == [
+            (col._remote_collection, field, "keyword") for field in ALL_INDEX_FIELDS
+        ]
 
 
 class TestFilterIndexFailureDegradation:
@@ -189,7 +206,8 @@ class TestNewCollectionIndexesAtBirth:
 
         created = _index_creates(client)
         assert (col._remote_collection, "document", "text") in created
-        assert (col._remote_collection, SOURCE_INDEX_FIELD, "keyword") in created
+        for field in ALL_INDEX_FIELDS:
+            assert (col._remote_collection, field, "keyword") in created
 
 
 class TestRealCollectionInfoEnvelope:
