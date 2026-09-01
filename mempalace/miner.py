@@ -19,6 +19,7 @@ import stat
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from .entity_detector import _apply_known_systems_prepass, _get_coca_filter
@@ -2233,6 +2234,81 @@ def _compute_entity_tunnels_for_wing(wing: str, config=None) -> int:
 # =============================================================================
 
 
+def _collection_supports_facets(col) -> bool:
+    """Return True if the collection's backend advertises metadata facets.
+
+    Same gate the MCP server applies before calling ``facet_counts``
+    (``mcp_server._supports_metadata_facets``), duplicated here because the
+    CLI must not import the MCP server module. Backends without the token
+    (chroma today) never reach the facet endpoint.
+    """
+    backend = getattr(col, "_backend", None)
+    capabilities = getattr(backend, "capabilities", None)
+    return isinstance(capabilities, (set, frozenset)) and "supports_metadata_facets" in capabilities
+
+
+def _facet_wing_room_counts(col) -> Optional[tuple[int, dict[str, dict[str, int]]]]:
+    """Tally drawers by wing/room via server-side facet counts (BRD P1/R2).
+
+    Backend-collection twin of ``_sqlite_wing_room_counts``: one ``count()``
+    for the header total, ``facet_counts("wing")`` for per-wing totals, then
+    per-wing ``facet_counts("room", where={"wing": ...})`` fanned out across a
+    bounded thread pool — the same aggregation the MCP server's wing/room
+    listings use (``tool_get_taxonomy``). Status cost scales with the number
+    of wings/rooms instead of scrolling every drawer payload across the wire.
+
+    Returns ``(total, {wing: {room: count}})`` or ``None`` when facets are
+    unusable — capability not advertised (chroma), ``UnsupportedCapabilityError``,
+    a facet-endpoint miss on older qdrant servers, or any other backend error.
+    ``None`` sends the caller down the ``get_all_metadata()``/paginated scan
+    status used before this fast path existed. Never raises; warns once.
+
+    Ordering: ``_print_status`` renders wings alphabetically and rooms by
+    count descending (stable sort), so room dicts are built count-desc with
+    an alphabetical tie-break — deterministic regardless of facet hit order.
+    (The scan paths break count ties by first-encounter order, which facet
+    aggregates cannot recover; alphabetical is the deterministic stand-in.)
+    Drawers a facet cannot see (missing wing/room metadata) are tallied under
+    the scan paths' ``"?"`` labels so the header total always equals the
+    histogram total; a drawer missing its wing but carrying a room renders as
+    ``?/?`` here, the one detail facet aggregates cannot reproduce.
+    """
+    if not _collection_supports_facets(col):
+        return None
+    try:
+        total = col.count()
+        wing_counts = col.facet_counts("wing")
+        wing_rooms: dict[str, dict[str, int]] = {}
+        # Drawers with no wing value are invisible to the wing facet; tally
+        # them under the scan paths' "?" label so total == histogram sum.
+        unknown_wing = total - sum(wing_counts.values())
+        if unknown_wing > 0:
+            wing_rooms["?"] = {"?": unknown_wing}
+        wings = list(wing_counts.keys())
+        with ThreadPoolExecutor(max_workers=max(1, min(8, len(wings)))) as executor:
+            futures = {
+                wing: executor.submit(col.facet_counts, "room", where={"wing": wing})
+                for wing in wings
+            }
+            for wing, future in futures.items():
+                rooms = future.result()
+                try:
+                    # Same deficit adjustment as the MCP server: drawers with
+                    # this wing but no room value don't appear in room facets.
+                    unknown_rooms = wing_counts[wing] - sum(rooms.values())
+                    if unknown_rooms > 0:
+                        rooms["?"] = rooms.get("?", 0) + unknown_rooms
+                except (TypeError, ValueError):
+                    pass
+                wing_rooms[wing] = dict(
+                    sorted(rooms.items(), key=lambda item: (-item[1], str(item[0])))
+                )
+        return total, wing_rooms
+    except Exception as exc:
+        logger.warning("status: facet aggregation unavailable (%s); using full scan", exc)
+        return None
+
+
 def status(palace_path: str):
     """Show what's been filed in the palace.
 
@@ -2264,6 +2340,17 @@ def status(palace_path: str):
     if capacity_info.get("diverged"):
         print(f"\n  HNSW index is diverged: {capacity_info.get('message', '')}")
         print("  Run `mempalace repair --mode from-sqlite --archive-existing` first.")
+        return
+
+    # Fast path: server-side facet aggregation (BRD P1/R2). Status cost scales
+    # with wings/rooms instead of drawer count — the same aggregation the MCP
+    # server's wing/room listings already use. Only attempted on backends
+    # advertising the facet capability; chroma and facet-less backends never
+    # enter, and any facet failure degrades cleanly to the scan paths below.
+    facet_tally = _facet_wing_room_counts(col)
+    if facet_tally is not None:
+        total, wing_rooms = facet_tally
+        _print_status(total, wing_rooms)
         return
 
     # Fast path: single-pass metadata fetch for backends that expose
