@@ -451,18 +451,25 @@ class _QdrantRESTClient:
             raise
 
     def list_payload_indexes(self, collection: str) -> list[str]:
-        """Return the payload index field names that exist on a collection.
+        """Return the payload index field paths that exist on a collection.
 
-        qdrant reports indexes at GET /collections/{name}/indexes as
-        {"result": {"indexes": [{"name": <payload field path>, ...}]}} --
-        the same field path create_payload_index() was called with. Used to
+        qdrant has NO list-index endpoint in any version (only PUT/DELETE
+        ``/index``; ``GET /collections/{n}/indexes`` is 404 -- verified live
+        against 1.18.3). Created payload indexes are reported in the
+        collection info response instead, as ``result.payload_schema``: a
+        dict keyed by field path --
+        {"metadata.source_file": {"data_type": "keyword", ...}, ...} --
+        exactly the paths create_payload_index() was called with. Used to
         make filter-index creation a once-per-collection event: create only
-        what the listing says is missing, so steady-state opens issue zero
-        creation calls.
+        what payload_schema says is missing, so steady-state opens issue
+        zero creation calls.
         """
-        data = self.request("GET", f"/collections/{urlparse.quote(collection, safe='')}/indexes")
-        indexes = (data.get("result") or {}).get("indexes") or []
-        return [entry["name"] for entry in indexes if isinstance(entry, dict) and entry.get("name")]
+        info = self.get_collection_info(collection)
+        result = info.get("result") or info
+        schema = result.get("payload_schema") or {}
+        if not isinstance(schema, dict):
+            return []
+        return [name for name in schema if isinstance(name, str)]
 
     def upsert_points(self, collection: str, points: list[dict]) -> None:
         self.request(

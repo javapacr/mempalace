@@ -61,13 +61,17 @@ import numpy  # noqa: E402,F401
 
 from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.base import PalaceRef  # noqa: E402
-from mempalace.backends.qdrant import QdrantCollection, _QdrantConfig  # noqa: E402
+from mempalace.backends.qdrant import (  # noqa: E402
+    QdrantCollection,
+    _QdrantConfig,
+    _QdrantRESTClient,
+)
 
 
 SOURCE_INDEX_FIELD = f"{qdrant_mod._PAYLOAD_METADATA}.source_file"
 
 
-def _make_qdrant_collection(scroll_pages):
+def _make_qdrant_collection(scroll_pages, marker_exists=True):
     """QdrantCollection with a mocked REST client (same shape as
     test_qdrant_bulk_metadata_scroll._make_qdrant_collection). scroll_pages:
     list[tuple[list[dict_point], next_offset]] served in order."""
@@ -81,7 +85,7 @@ def _make_qdrant_collection(scroll_pages):
 
     backend = mock.MagicMock()
     backend._closed = False
-    backend._marker_exists.return_value = True
+    backend._marker_exists.return_value = marker_exists
 
     palace = PalaceRef(id="/tmp/fake-palace", local_path="/tmp/fake-palace")
     col = QdrantCollection(
@@ -166,9 +170,8 @@ class TestFilterIndexFailureDegradation:
         the corrupted marker that raises CollectionNotInitializedError) ->
         nothing to index; ensure must not call list or create (the create
         path handles new collections at birth)."""
-        col, client = _make_qdrant_collection([])
+        col, client = _make_qdrant_collection([], marker_exists=False)
         client.collection_exists.return_value = False
-        col._backend._marker_exists.return_value = False
 
         assert col.get_all_metadata() == []
         client.list_payload_indexes.assert_not_called()
@@ -187,3 +190,56 @@ class TestNewCollectionIndexesAtBirth:
         created = _index_creates(client)
         assert (col._remote_collection, "document", "text") in created
         assert (col._remote_collection, SOURCE_INDEX_FIELD, "keyword") in created
+
+
+class TestRealCollectionInfoEnvelope:
+    """Regression tests for the listing source itself, driving the REAL
+    _QdrantRESTClient.list_payload_indexes with a captured live response
+    (CVP drawers, qdrant 1.18.3). The first implementation read a
+    nonexistent /indexes endpoint; MagicMock clients kept CI green while
+    the feature was dead in production. A captured-envelope test means an
+    endpoint/envelope assumption can no longer pass CI while wrong."""
+
+    def test_parses_captured_collection_info_payload_schema(self, monkeypatch):
+        captured = {
+            "result": {
+                "status": "yellow",
+                "points_count": 457970,
+                "payload_schema": {
+                    "document": {"data_type": "text", "points": 457968},
+                    "metadata.source_file": {
+                        "data_type": "keyword",
+                        "points": 457970,
+                    },
+                },
+            },
+            "status": "ok",
+            "time": 0.018,
+        }
+        client = _QdrantRESTClient(_QdrantConfig(url="http://localhost:6333"))
+        monkeypatch.setattr(client, "request", lambda method, path, query=None, body=None: captured)
+
+        assert sorted(client.list_payload_indexes("mempalace_cvp")) == [
+            "document",
+            "metadata.source_file",
+        ]
+
+    def test_tolerates_bare_envelope_without_result_wrapper(self, monkeypatch):
+        client = _QdrantRESTClient(_QdrantConfig(url="http://localhost:6333"))
+        monkeypatch.setattr(
+            client,
+            "request",
+            lambda method, path, query=None, body=None: {
+                "payload_schema": {"metadata.source_file": {"data_type": "keyword"}}
+            },
+        )
+
+        assert client.list_payload_indexes("mempalace_cvp") == ["metadata.source_file"]
+
+    def test_absent_payload_schema_returns_empty(self, monkeypatch):
+        client = _QdrantRESTClient(_QdrantConfig(url="http://localhost:6333"))
+        monkeypatch.setattr(
+            client, "request", lambda method, path, query=None, body=None: {"result": {}}
+        )
+
+        assert client.list_payload_indexes("mempalace_cvp") == []
