@@ -738,6 +738,38 @@ class TestHandleRequest:
             for keyword in ("anyOf", "oneOf", "allOf"):
                 assert keyword not in schema, f"{tool['name']} schema has top-level {keyword}"
 
+    def test_palace_protocol_rule4_has_repo_wing_diary_hint(self):
+        """Repo-wing diary hint (BRD P2): protocol rule 4 tells the
+        agent to file repo-anchored diary entries under the repo's wing,
+        with the agent wing as the fallback for personal/cross-repo work.
+        Hermetic string assertion — the protocol is static text included
+        in every status/wake-up response.
+        """
+        from mempalace.mcp_server import PALACE_PROTOCOL
+
+        rule4 = next(line for line in PALACE_PROTOCOL.splitlines() if line.startswith("4."))
+        assert "anchored in a long-lived repo" in rule4
+        assert "wing=<repo-wing>" in rule4
+        assert "keep personal or cross-repo entries in your agent wing" in rule4
+
+    def test_diary_write_tool_help_mentions_repo_wing(self):
+        """Repo-wing diary hint (BRD P2): the mempalace_diary_write
+        tool help — the TOOLS catalog description, its ``wing`` parameter
+        description, and the handler docstring — points at protocol rule 4
+        for repo-anchored work. Hermetic string assertions.
+        """
+        from mempalace import mcp_server
+
+        tool = mcp_server.TOOLS["mempalace_diary_write"]
+        assert "repo's wing" in tool["description"]
+        assert "protocol rule 4" in tool["description"]
+        wing_help = tool["input_schema"]["properties"]["wing"]["description"]
+        assert "repo's wing" in wing_help
+        assert "protocol rule 4" in wing_help
+        docstring = mcp_server.tool_diary_write.__doc__ or ""
+        assert "repo's wing" in docstring
+        assert "protocol rule 4" in docstring
+
     def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
         """Sending arguments: null should return a result, not hang (#394)."""
         _patch_mcp_server(monkeypatch, config, seeded_kg)

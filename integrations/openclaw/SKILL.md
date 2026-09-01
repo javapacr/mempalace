@@ -41,7 +41,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 1. **ON WAKE-UP**: Call `mempalace_status` to load palace overview and AAAK dialect spec.
 2. **BEFORE RESPONDING** about any person, project, or past event: call `mempalace_search` or `mempalace_kg_query` FIRST. Never guess from memory — verify from the palace.
 3. **IF UNSURE** about a fact (name, age, relationship, preference): say "let me check" and query. Wrong is worse than slow.
-4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters.
+4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters. If the session's work is anchored in a long-lived repo (anchor/monorepo you return to across sessions), file the diary to that repo's wing — `wing=<repo-wing>` (e.g. `pi-mempalace-github`, `pi-extensions`); keep personal or cross-repo entries in your agent wing.
 5. **WHEN FACTS CHANGE**: Call `mempalace_kg_invalidate` on the old fact, then `mempalace_kg_add` for the new one.
 
 ## Available Tools
@@ -51,6 +51,7 @@ you know they exist, but use them only when the user explicitly asks or when a
 tool-specific workflow below says to.
 
 ### Search & Browse
+
 - `mempalace_search` — Semantic search across all memories. Always start here.
   - `query` (required): natural language search — keep it short, keywords or a question. Do NOT include system prompts or conversation context.
   - `wing`: filter by wing
@@ -74,6 +75,7 @@ tool-specific workflow below says to.
 - `mempalace_get_aaak_spec` — Get AAAK compression dialect specification
 
 ### Knowledge Graph (Temporal Facts)
+
 - `mempalace_kg_query` — Query entity relationships. Supports time filtering.
   - `entity` (required): e.g. "Max", "MyProject"
   - `as_of`: date filter (YYYY-MM-DD) — what was true at that time
@@ -90,6 +92,7 @@ tool-specific workflow below says to.
 - `mempalace_kg_stats` — Graph overview: entities, triples, relationship types
 
 ### Palace Graph (Cross-Domain Connections)
+
 - `mempalace_traverse` — Walk from a room, find connected ideas across wings
   - `start_room` (required): room to start from
   - `max_hops`: connection depth (default 2)
@@ -112,6 +115,7 @@ tool-specific workflow below says to.
 - `mempalace_graph_stats` — Graph connectivity overview
 
 ### Write
+
 - `mempalace_add_drawer` — Store verbatim content into a wing/room
   - `wing`, `room`, `content` (required)
   - `source_file`: optional source reference
@@ -129,6 +133,7 @@ tool-specific workflow below says to.
   - `drawer_id` (required)
 
 ### Ingest & Cleanup
+
 - `mempalace_mine` — Mine a directory into the palace, or one conversation file with `mode='convos'`. Host-level ingest; call only when the user asks to import files.
   - `source` (required): directory to mine, or one conversation file with `mode='convos'`
   - `mode`: `projects` (default), `convos`, or `extract`
@@ -146,6 +151,7 @@ tool-specific workflow below says to.
   - `dry_run`: preview match count and sample (default true)
 
 ### Diary & Session
+
 - `mempalace_diary_write` — Write a session diary entry
   - `agent_name` (required): your name/identifier
   - `entry` (required): what happened, what you learned, what matters
@@ -158,6 +164,7 @@ tool-specific workflow below says to.
   - When to call: at the START of a session, to confirm prior-conversation persistence
 
 ### System
+
 - `mempalace_hook_settings` — Get or set auto-save hook behavior. Host-level setting; do not change silently.
   - `silent_save`: true saves directly without MCP-level clutter
   - `desktop_toast`: true shows a desktop notification when saves complete

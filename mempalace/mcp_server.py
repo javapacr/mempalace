@@ -2271,7 +2271,7 @@ PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
 2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
 3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
-4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
+4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters. If the session's work is anchored in a long-lived repo (anchor/monorepo you return to across sessions), file the diary to that repo's wing — `wing=<repo-wing>` (e.g. `pi-mempalace-github`, `pi-extensions`); keep personal or cross-repo entries in your agent wing.
 5. WHEN A SINGLE-VALUED FACT CHANGES (model, employer, address): call mempalace_kg_supersede(subject, predicate, old, new) to replace it atomically at one boundary — do NOT hand-roll invalidate + add, which leaves the old and new values overlapping at the boundary. Use mempalace_kg_invalidate for a fact that simply ended, and mempalace_kg_add to add an independent (possibly concurrent) fact.
 
 This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
@@ -4123,6 +4123,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
 
+    ``wing``: for repo-anchored work, use the repo's wing
+    (protocol rule 4); defaults to your agent wing.
+
     Note: ``agent_name`` is normalized to lowercase before storage so
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
@@ -5518,7 +5521,7 @@ TOOLS = {
         "handler": tool_update_drawer,
     },
     "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec. For repo-anchored work, use the repo's wing (protocol rule 4); defaults to your agent wing.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -5536,7 +5539,7 @@ TOOLS = {
                 },
                 "wing": {
                     "type": "string",
-                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
+                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing. For repo-anchored work, use the repo's wing (protocol rule 4); defaults to your agent wing.",
                 },
                 "content": {
                     "type": "string",
