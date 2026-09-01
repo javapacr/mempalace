@@ -243,3 +243,80 @@ class TestRealCollectionInfoEnvelope:
         )
 
         assert client.list_payload_indexes("mempalace_cvp") == []
+
+
+class TestCreatePayloadIndexRequestShape:
+    """Regression tests for index-adoption request shape (2026-09-01
+    incident). The first-adoption PUT carried ``wait=true``, blocking until
+    the server-side build completed; on the 458k-point CVP drawers
+    collection that outran the 10s default client timeout, so every
+    first-adoption open failed client-side while the server kept building.
+    Adoption must be non-blocking (``wait=false``): the PUT returns once
+    accepted. Driving the REAL _QdrantRESTClient.request (same
+    captured-response pattern as TestRealCollectionInfoEnvelope) so a
+    query-parameter regression can't pass CI while wrong."""
+
+    @staticmethod
+    def _client_capturing_request(monkeypatch):
+        client = _QdrantRESTClient(_QdrantConfig(url="http://localhost:6333"))
+        calls: list[dict] = []
+
+        def fake_request(method, path, query=None, body=None):
+            calls.append({"method": method, "path": path, "query": query, "body": body})
+            # Live response shape for PUT /index with wait=false against
+            # qdrant 1.18.3: acknowledged (accepted), not completed.
+            return {
+                "result": {"operation_id": 1827, "status": "acknowledged"},
+                "status": "ok",
+                "time": 0.004,
+            }
+
+        monkeypatch.setattr(client, "request", fake_request)
+        return client, calls
+
+    def test_create_request_carries_wait_false(self, monkeypatch):
+        """Adoption PUT is non-blocking: query carries wait=false, endpoint is
+        /collections/{name}/index, and the body names field + schema."""
+        client, calls = self._client_capturing_request(monkeypatch)
+
+        client.create_payload_index("mempalace_cvp", "metadata.source_file", "keyword")
+
+        assert calls == [
+            {
+                "method": "PUT",
+                "path": "/collections/mempalace_cvp/index",
+                "query": {"wait": "false"},
+                "body": {
+                    "field_name": "metadata.source_file",
+                    "field_schema": "keyword",
+                },
+            }
+        ]
+
+    @staticmethod
+    def _client_raising_http_error(monkeypatch, status: int):
+        client = _QdrantRESTClient(_QdrantConfig(url="http://localhost:6333"))
+
+        def raise_http_error(method, path, query=None, body=None):
+            raise qdrant_mod._QdrantHTTPError(status, "already exists")
+
+        monkeypatch.setattr(client, "request", raise_http_error)
+        return client
+
+    @pytest.mark.parametrize("status", [400, 409])
+    def test_already_indexed_race_skips_cleanly(self, monkeypatch, status):
+        """400/409 from the PUT (already-indexed race) must skip (debug-log +
+        return), never raise -- the ensure path treats adoption as best-effort."""
+        client = self._client_raising_http_error(monkeypatch, status)
+
+        assert (
+            client.create_payload_index("mempalace_cvp", "metadata.source_file", "keyword") is None
+        )
+
+    def test_other_http_errors_propagate(self, monkeypatch):
+        """Only 400/409 are skipped; unexpected HTTP errors still surface."""
+        client = self._client_raising_http_error(monkeypatch, 500)
+
+        with pytest.raises(qdrant_mod._QdrantHTTPError) as excinfo:
+            client.create_payload_index("mempalace_cvp", "metadata.source_file", "keyword")
+        assert excinfo.value.status == 500

@@ -437,11 +437,17 @@ class _QdrantRESTClient:
         )
 
     def create_payload_index(self, collection: str, field_name: str, field_schema: str) -> None:
+        # wait=false: index builds run asynchronously server-side and can take
+        # minutes on large collections (458k-point drawers collection), so a
+        # blocking PUT client-times-out on every first-adoption open against
+        # the default 10s timeout. The PUT returns once accepted;
+        # list_payload_indexes() (payload_schema) already reports the field,
+        # so the once-per-collection ensure never re-creates.
         try:
             self.request(
                 "PUT",
                 f"/collections/{urlparse.quote(collection, safe='')}/index",
-                query={"wait": "true"},
+                query={"wait": "false"},
                 body={"field_name": field_name, "field_schema": field_schema},
             )
         except _QdrantHTTPError as exc:
