@@ -241,8 +241,8 @@ class TestLimitPushdown:
         # Should only have made one scroll call (no pagination needed)
         assert len(fake_client.scroll_calls) == 1
 
-    def test_get_limit_and_offset_calculates_stop_after(self, tmp_path, fake_qdrant):
-        """get(limit=50, offset=25) → stop_after=75 equivalence with full-scan slice."""
+    def test_get_limit_and_offset_calculates_max_rows(self, tmp_path, fake_qdrant):
+        """get(limit=50, offset=25) → max_rows=75 equivalence with full-scan slice."""
         backend, col = _make_collection(tmp_path, fake_qdrant=fake_qdrant)
         ids, docs, metas, _ = _populate_1000_rows(col)
         fake_client = fake_qdrant.instances[0]
@@ -250,7 +250,7 @@ class TestLimitPushdown:
         fake_client.scroll_calls.clear()
         result = col.get(limit=50, offset=25)
 
-        # stop_after should be 75 (offset + limit)
+        # max_rows should be 75 (offset + limit)
         first_call = fake_client.scroll_calls[0]
         assert first_call["limit"] == 75
 
@@ -268,7 +268,7 @@ class TestLimitPushdown:
         result = col.get(ids=["doc-0001", "doc-0005", "doc-0010"], limit=10)
 
         # Should use default page size (4096) for full scan when ids are specified
-        # or stop_after should be None
+        # or max_rows should be None
         assert len(fake_client.scroll_calls) == 1
         assert fake_client.scroll_calls[0]["limit"] == 4096  # Default page size
         assert result.ids == ["doc-0001", "doc-0005", "doc-0010"]
@@ -321,7 +321,7 @@ class TestLimitPushdown:
         assert all(meta["wing"] in ("wing-0", "wing-1") for meta in result.metadatas)
 
     def test_cursor_continuation_with_small_page_size(self, tmp_path, fake_qdrant):
-        """Canned page size smaller than stop_after → multiple scroll calls, first with pushed limit."""
+        """Canned page size smaller than max_rows → multiple scroll calls, first with pushed limit."""
         backend, col = _make_collection(tmp_path, fake_qdrant=fake_qdrant)
         _populate_1000_rows(col)
         fake_client = fake_qdrant.instances[0]
@@ -331,7 +331,7 @@ class TestLimitPushdown:
         result = col.get(limit=100)
 
         # Should have made multiple calls (page size 4096, so actually just 1 for 100 rows)
-        # But the first call should have limit=100 (stop_after hint)
+        # But the first call should have limit=100 (max_rows hint)
         assert len(fake_client.scroll_calls) >= 1
         first_call = fake_client.scroll_calls[0]
         assert first_call["limit"] == 100
@@ -362,7 +362,7 @@ class TestLimitPushdown:
             assert result.ids == expected_ids, f"Mismatch at offset={offset}, limit={limit}"
 
     def test_get_all_metadata_uncapped(self, tmp_path, fake_qdrant):
-        """get_all_metadata() explicitly uncapped (stop_after not used)."""
+        """get_all_metadata() explicitly uncapped (max_rows not used)."""
         backend, col = _make_collection(tmp_path, fake_qdrant=fake_qdrant)
         _populate_1000_rows(col)
         fake_client = fake_qdrant.instances[0]
@@ -400,7 +400,7 @@ class TestLimitPushdown:
         result = col.get(offset=1000, limit=10)
 
         # Should stop after checking we have 0 rows to return
-        # stop_after = 1010, but server will return 0 rows
+        # max_rows = 1010, but server will return 0 rows
         assert len(result.ids) == 0
 
     def test_limit_larger_than_matching_rows(self, tmp_path, fake_qdrant):
