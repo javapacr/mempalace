@@ -1410,6 +1410,7 @@ class QdrantBackend(BaseBackend):
             "qdrant": self._marker_target(palace, config),
         }
         marker_path = self._marker_path(palace.local_path)
+        # pi-lens-ignore: ast-grep:unchecked-throwing-call-python
         with open(marker_path, "w", encoding="utf-8") as f:
             json.dump(marker, f, indent=2, ensure_ascii=False)
         try:
