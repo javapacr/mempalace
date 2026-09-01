@@ -1,7 +1,13 @@
 {
   "mcpServers": {
     "mempalace": {
-      "command": "mempalace-mcp"
+      "command": "mempalace-mcp",
+      "env": {
+        "MEMPALACE_BACKEND": "chroma",
+        "MEMPALACE_PALACE_PATH": "/Users/reevonr/Documents/projects/personal/mempalace/.mcp-palace",
+        "MEMPALACE_QDRANT_NAMESPACE": "mcp-test",
+        "MEMPALACE_MCP_ALLOW_PEER_WRITER": "1"
+      }
     }
   }
 }
