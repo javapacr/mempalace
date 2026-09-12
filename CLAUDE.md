@@ -1,5 +1,26 @@
 # CLAUDE.md
 
+## Repo intent — personal-use fork
+
+This repository is a personal-use fork of MemPalace/mempalace (remote
+`upstream`). It is where this machine's palace actually runs and where
+fork-only enhancements are proven before promotion.
+
+- **Fork-first promotion.** Enhancements and fixes land on `develop` here and
+  are tested in real use. They are raised to upstream only when the owner
+  explicitly promotes them; until then they stay on this fork.
+- **Regular upstream syncs, evidence first.** The owner will regularly ask for
+  upstream changes to be synced here. Every sync reports the incoming changes
+  in detail before touching `develop`: divergence counts (ahead/behind), a
+  per-commit inventory of what each change is and the value it adds, the
+  conflict surface against fork-only work, and trial-merge + full-suite
+  verification evidence.
+- **Minimal, explicit delta.** Keep the fork's divergence from upstream
+  auditable: restore fork-only features in dedicated transplant commits, and
+  land fixes for upstream's own breakage as clearly-labeled commits that are
+  candidates for an upstream PR. Enhancement docs live linked from
+  [docs/backlog.md](docs/backlog.md).
+
 ## The Mission
 
 Memory is identity. When an AI forgets everything between conversations, it cannot build real understanding — of you, your work, your people, your life.
