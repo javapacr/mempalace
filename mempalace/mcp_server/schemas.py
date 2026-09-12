@@ -590,7 +590,7 @@ TOOLS = {
         "handler": tool_update_drawer,
     },
     "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec. For repo-anchored work, use the repo's wing (protocol rule 4); defaults to your agent wing.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -608,7 +608,7 @@ TOOLS = {
                 },
                 "wing": {
                     "type": "string",
-                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
+                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing. For repo-anchored work, use the repo's wing (protocol rule 4); defaults to your agent wing.",
                 },
                 "content": {
                     "type": "string",

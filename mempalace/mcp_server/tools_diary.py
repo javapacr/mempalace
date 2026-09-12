@@ -14,6 +14,9 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
 
+    ``wing``: for repo-anchored work, use the repo's wing
+    (protocol rule 4); defaults to your agent wing.
+
     Note: ``agent_name`` is normalized to lowercase before storage so
     that diary reads are case-insensitive (see #1243). "Claude",
     "claude", and "CLAUDE" all resolve to the same agent.
