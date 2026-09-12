@@ -8,9 +8,12 @@ tasks:
       - "git merge upstream/develop --no-edit || (git merge --abort && exit 1)"
 
   install:
-    desc: Sync deps + install mempalace into mise Python 3.13, verify version
+    desc: Sync deps + native Rust ext + mempalace into mise Python 3.13, verify
     sources:
       - mempalace/**/*.py
+      - crates/**/*.rs
+      - crates/*/Cargo.toml
+      - crates/mempalace-py/pyproject.toml
       - pyproject.toml
     vars:
       PYTHON: >-
@@ -21,4 +24,15 @@ tasks:
       - >-
         uv pip install --python {{.PYTHON}} --force-reinstall --no-deps
         {{.ROOT_DIR}}
+      # Native Rust exact-search ext (optional; skips without cargo)
+      - >-
+        sh -c 'if command -v cargo >/dev/null 2>&1; then
+        uv pip install --force-reinstall --python {{.PYTHON}}
+        ./crates/mempalace-py;
+        else echo "skip native ext: no cargo (python fallback)"; fi'
       - "{{.PYTHON}} -m mempalace --version"
+      - >-
+        sh -c 'if {{.PYTHON}} -c "from mempalace.backends.rust_exact import
+        _NativeVectorIndex as N; assert N" 2>/dev/null;
+        then echo "native extension: OK";
+        else echo "native extension: ABSENT (python fallback)"; fi'
