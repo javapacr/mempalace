@@ -12,7 +12,12 @@ measured ~84 min/pass-pair on the 458k-point CVP palace. The fix routes
 both helpers through `collection.get_all_metadata()`, which is one
 continuous cursor walk on backends that override it (#1796: qdrant,
 milvus, pgvector) and the base offset loop on backends with true
-server-side cursors (chroma) -- linear on both.
+server-side cursors (chroma) -- linear on both. Since the #2567 split the
+helpers live in mempalace/palace/mined.py (an exec'd fragment of the
+mempalace.palace package -- import and patch through mempalace.palace,
+never the fragment module), and C9 applies only to the unscoped full scan:
+a prefetch_mined_set call with <= _PREFETCH_SCOPE_THRESHOLD source_files
+keeps upstream's scoped `$in` get() (covered in section 6).
 
 Covers:
   1. Prefetch semantics on the qdrant path -- multi-page mocked scroll
@@ -104,7 +109,10 @@ from mempalace.backends.base import (  # noqa: E402
 from mempalace.backends import qdrant as qdrant_mod  # noqa: E402
 from mempalace.backends.qdrant import QdrantCollection, _QdrantConfig  # noqa: E402
 from mempalace.palace import (  # noqa: E402
+    _PREFETCH_SCOPE_THRESHOLD,
+    CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
+    _meta_is_current,
     _metadata_matches_extract_mode,
     prefetch_content_hashes,
     prefetch_mined_set,
@@ -171,19 +179,25 @@ def _drawer_meta(
     chunk_total: Optional[int] = None,
     content_hash: Optional[str] = None,
     extract_mode: Optional[str] = "exchange",
+    convo_chunker_version: Optional[int] = CONVO_CHUNKER_VERSION,
 ):
     """Metadata carrying exactly the fields the prefetch helpers read:
     source_file, wing, source_mtime, normalize_version, chunk_total,
-    content_hash, extract_mode. Optional fields are OMITTED (not set to
-    None) when absent, matching how real drawers look before a field
-    existed: prefetch reads them with meta.get(), and
+    content_hash, extract_mode, convo_chunker_version. Optional fields are
+    OMITTED (not set to None) when absent, matching how real drawers look
+    before a field existed: prefetch reads them with meta.get(), and
     _metadata_matches_extract_mode keys off the *missing key* for its
-    legacy-compat rule."""
+    legacy-compat rule. convo_chunker_version defaults to the current
+    value so exchange rows count as current under upstream's
+    _meta_is_current rule (#2567 era); pass None for a pre-chunker-version
+    (legacy) row, which is stale in the exchange scope."""
     meta = {
         "source_file": source_file,
         "wing": wing,
         "normalize_version": normalize_version,
     }
+    if convo_chunker_version is not None:
+        meta["convo_chunker_version"] = convo_chunker_version
     if extract_mode is not None:
         meta["extract_mode"] = extract_mode
     if source_mtime is not None:
@@ -231,7 +245,15 @@ def _semantic_pages():
                         content_hash="h1,h2",
                     ),
                 ),
-                _fake_point("d1", _drawer_meta("/a/legacy.txt", source_mtime=None)),
+                _fake_point(
+                    "d1",
+                    _drawer_meta(
+                        "/a/legacy.txt",
+                        source_mtime=None,
+                        extract_mode=None,
+                        convo_chunker_version=None,
+                    ),
+                ),
                 _fake_point(
                     "d2",
                     _drawer_meta(
@@ -306,8 +328,9 @@ class TestPrefetchQdrantPathSemantics:
         assert mined == {
             # Group completed by the page-2 drawer (count 2 >= chunk_total 2).
             "/a/session1.jsonl": 1000.5,
-            # Legacy row: no stored mtime -> None must surface, not be absent.
-            "/a/legacy.txt": None,
+            # legacy.txt filtered: no convo_chunker_version is stale in the
+            # exchange scope (_meta_is_current); it surfaces with a None
+            # mtime under extract_mode=None below.
             # 2-of-3 partial group must be omitted (#2183), not trusted.
             # stale.jsonl filtered: normalize_version 1 < 2.
             # general.jsonl filtered: extract_mode mismatch.
@@ -536,9 +559,10 @@ class _FakeOffsetPagedCollection(BaseCollection):
 
 def _legacy_prefetch_mined_set(collection, extract_mode=None):
     """VERBATIM copy of the pre-C9 prefetch_mined_set fetch+group algorithm
-    (mempalace/palace.py before the get_all_metadata() rewrite): count() +
-    get(limit=1000, offset=) page loop, then the chunk_total completion
-    fold. Serves as the semantic oracle for
+    (upstream's unscoped _scan_all in mempalace/palace/mined.py at 8c4865f,
+    before the get_all_metadata() re-apply): count() + get(limit=1000,
+    offset=) page loop filtered by _meta_is_current, then the chunk_total
+    completion fold. Serves as the semantic oracle for
     TestSemanticsPreservedVsLegacyAlgorithm: for any collection whose
     get() serves honest slices (chroma), the rewrite must return exactly
     this dict. If the real prefetch's grouping/filter semantics ever
@@ -556,9 +580,7 @@ def _legacy_prefetch_mined_set(collection, extract_mode=None):
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
-                # Same default as file_already_mined: missing version == 1
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 stored_mtime = meta.get("source_mtime")
                 mtime_key = float(stored_mtime) if stored_mtime is not None else None
@@ -612,8 +634,7 @@ def _legacy_prefetch_content_hashes(collection, extract_mode=None):
                     continue
                 if not _metadata_matches_extract_mode(meta, extract_mode):
                     continue
-                version = meta.get("normalize_version", 1)
-                if version < NORMALIZE_VERSION:
+                if not _meta_is_current(meta, extract_mode):
                     continue
                 for content_hash in content_hash_field.split(","):
                     key = (wing, content_hash)
@@ -645,6 +666,7 @@ def _mixed_corpus():
             "source_file": "/a/complete.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000000.0,
             "chunk_total": 3,
@@ -654,6 +676,7 @@ def _mixed_corpus():
             "source_file": "/a/complete.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000000.0,
             "chunk_total": 3,
@@ -663,6 +686,7 @@ def _mixed_corpus():
             "source_file": "/a/complete.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000000.0,
             "chunk_total": 3,
@@ -674,6 +698,7 @@ def _mixed_corpus():
             "source_file": "/a/partial.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000100.0,
             "chunk_total": 3,
@@ -683,6 +708,7 @@ def _mixed_corpus():
             "source_file": "/a/partial.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000100.0,
             "chunk_total": 3,
@@ -701,6 +727,7 @@ def _mixed_corpus():
             "source_file": "/a/stale.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": 1,
             "source_mtime": 1700000200.0,
             "content_hash": "hE",
@@ -728,6 +755,7 @@ def _mixed_corpus():
             "source_file": "/a/badtotal.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000500.0,
             "chunk_total": "three",
@@ -738,6 +766,7 @@ def _mixed_corpus():
             "source_file": "/a/dup_late.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000600.0,
             "content_hash": "hA",
@@ -747,6 +776,7 @@ def _mixed_corpus():
             "source_file": "/a/trailingcomma.jsonl",
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "source_mtime": 1700000700.0,
             "content_hash": "hH,",
@@ -755,6 +785,7 @@ def _mixed_corpus():
         {
             "wing": "w1",
             "extract_mode": "exchange",
+            "convo_chunker_version": CONVO_CHUNKER_VERSION,
             "normalize_version": NORMALIZE_VERSION,
             "content_hash": "hI",
         },
@@ -871,3 +902,89 @@ class TestPartialFetchSwallowPreserved:
 
         assert result == {}
         assert warning_fragment in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 6. C9 coexists with the #2567 source_files scoping
+# ---------------------------------------------------------------------------
+
+
+class _ScopeSpyCollection:
+    """Records every get() and get_all_metadata() call. get() honours a
+    `{"source_file": {"$in": [...]}}` filter and offset/limit slicing, so
+    it stands in for a backend serving the scoped path honestly."""
+
+    def __init__(self, all_metadata):
+        self._all = all_metadata
+        self.get_calls: list = []
+        self.get_all_metadata_calls = 0
+
+    def get_all_metadata(self):
+        self.get_all_metadata_calls += 1
+        return list(self._all)
+
+    def get(self, *, where=None, include=None, limit=None, offset=None, **_kw):
+        self.get_calls.append({"where": where, "limit": limit, "offset": offset})
+        rows = self._all
+        if where is not None:
+            wanted = set(where["source_file"]["$in"])
+            rows = [m for m in rows if (m or {}).get("source_file") in wanted]
+        offset = offset or 0
+        limit = limit if limit is not None else len(rows)
+        page = rows[offset : offset + limit]
+        return {"ids": [f"id{i}" for i in range(len(page))], "metadatas": page}
+
+    def count(self):
+        raise AssertionError("prefetch must not call count() (C9)")
+
+
+class TestScopedPathCoexistsWithSinglePass:
+    def _corpus(self):
+        return [
+            _drawer_meta("/a/one.jsonl", source_mtime=1.0),
+            _drawer_meta("/a/two.jsonl", source_mtime=2.0),
+            _drawer_meta("/a/other.jsonl", source_mtime=3.0),
+        ]
+
+    def test_small_source_files_uses_scoped_get_not_get_all_metadata(self):
+        col = _ScopeSpyCollection(self._corpus())
+        wanted = ["/a/one.jsonl", "/a/two.jsonl"]
+        assert len(wanted) <= _PREFETCH_SCOPE_THRESHOLD
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=wanted)
+
+        assert mined == {"/a/one.jsonl": 1.0, "/a/two.jsonl": 2.0}
+        assert col.get_all_metadata_calls == 0
+        assert col.get_calls, "scoped path must issue a filtered get()"
+        assert all(c["where"] == {"source_file": {"$in": wanted}} for c in col.get_calls)
+
+    def test_source_files_at_threshold_still_scoped(self):
+        col = _ScopeSpyCollection(self._corpus())
+        wanted = ["/a/one.jsonl"] + [
+            f"/a/missing{i}.jsonl" for i in range(_PREFETCH_SCOPE_THRESHOLD - 1)
+        ]
+        assert len(wanted) == _PREFETCH_SCOPE_THRESHOLD
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=wanted)
+
+        assert mined == {"/a/one.jsonl": 1.0}
+        assert col.get_all_metadata_calls == 0
+
+    def test_above_threshold_uses_single_pass(self):
+        col = _ScopeSpyCollection(self._corpus())
+        wanted = [f"/a/f{i}.jsonl" for i in range(_PREFETCH_SCOPE_THRESHOLD + 1)]
+
+        mined = prefetch_mined_set(col, extract_mode="exchange", source_files=wanted)
+
+        # Full single pass: every current row is visible, not just `wanted`.
+        assert mined == {"/a/one.jsonl": 1.0, "/a/two.jsonl": 2.0, "/a/other.jsonl": 3.0}
+        assert col.get_all_metadata_calls == 1
+        assert col.get_calls == []
+
+    def test_unscoped_call_uses_single_pass(self):
+        col = _ScopeSpyCollection(self._corpus())
+
+        prefetch_mined_set(col, extract_mode="exchange")
+
+        assert col.get_all_metadata_calls == 1
+        assert col.get_calls == []

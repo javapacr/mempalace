@@ -140,6 +140,38 @@ def file_already_mined(
         return False
 
 
+def _page_all_metadata_via_get(collection) -> list[dict]:
+    """Offset-page a bulk metadata fetch for collections that predate the
+    ``get_all_metadata`` contract method (#1796) -- e.g. a raw chromadb
+    ``Collection``, which exposes only count()/get(). Same loop shape as
+    BaseCollection.get_all_metadata's default and mcp_server's
+    _fetch_all_metadata fallback: on such backends get(limit=, offset=)
+    has a true server-side cursor, so this is linear, just not the
+    single-cursor pass overriding backends provide."""
+    all_meta: list[dict] = []
+    offset = 0
+    page_size = 1000
+    while True:
+        batch = collection.get(limit=page_size, offset=offset, include=["metadatas"])
+        batch_meta = batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+        if not batch_meta:
+            break
+        all_meta.extend(batch_meta)
+        if len(batch_meta) < page_size:
+            break
+        offset += len(batch_meta)
+    return all_meta
+
+
+def _iter_all_metadata(collection):
+    """One bulk metadata pass for the prefetch helpers (C9): the
+    ``get_all_metadata`` contract method when the collection has it, else
+    :func:`_page_all_metadata_via_get`."""
+    if hasattr(collection, "get_all_metadata"):
+        return collection.get_all_metadata()
+    return _page_all_metadata_via_get(collection)
+
+
 # Above this many candidate files, one filtered get costs more round trips
 # than a full paginated scan, so the scoped path below stops paying off.
 _PREFETCH_SCOPE_THRESHOLD = 50
@@ -178,7 +210,18 @@ def prefetch_mined_set(
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
-    helper drops that to a single paginated scan plus O(1) lookups.
+    helper drops that to a single cursor pass plus O(1) lookups, fetched
+    via :meth:`collection.get_all_metadata` -- one continuous cursor walk
+    on backends that override it (qdrant, milvus, pgvector), the base
+    offset loop on backends with true server-side cursors (e.g. chroma).
+    Collections predating the contract method (a raw chromadb Collection)
+    fall back to the per-page `get(limit=, offset=)` loop these helpers
+    used before C9 -- still linear there, since such get() has a true
+    server-side cursor. Driving that loop unconditionally was O(n^2) on
+    materialize-then-slice backends -- every page re-walked the whole
+    collection just to discard everything outside its slice (see
+    docs/brd-p1-review-findings.md C9). The scoped path below is
+    unaffected: it is already a small filtered get.
 
     When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
     paths, the caller already knows the only source_file values that could
@@ -215,15 +258,8 @@ def prefetch_mined_set(
                 pass
 
     def _scan_all():
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                _absorb(meta)
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+        for meta in _iter_all_metadata(collection):
+            _absorb(meta)
 
     try:
         if source_files is not None and len(source_files) <= _PREFETCH_SCOPE_THRESHOLD:
@@ -308,31 +344,32 @@ def prefetch_content_hashes(
     under_new_filename and test_mine_convos_skips_same_conversation_within_
     re_exported_bundle, which a source_files-scoped or skipped version of
     this function broke.
+
+    Like :func:`prefetch_mined_set`, the scan is a single cursor pass via
+    :meth:`collection.get_all_metadata` -- one continuous cursor walk on
+    backends that override it (qdrant, milvus, pgvector), the base offset
+    loop on backends with true server-side cursors (e.g. chroma), and the
+    per-page `get(limit=, offset=)` fallback for collections predating
+    the contract method. Driving that loop unconditionally was O(n^2) on
+    materialize-then-slice backends (see docs/brd-p1-review-findings.md C9).
     """
     hashes: dict[tuple[str, str], str] = {}
     try:
-        total = collection.count()
-        offset = 0
-        while offset < total:
-            batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-            for meta in batch["metadatas"]:
-                meta = meta or {}
-                content_hash_field = meta.get("content_hash")
-                src = meta.get("source_file")
-                wing = meta.get("wing")
-                if not content_hash_field or not src or not wing:
-                    continue
-                if not _metadata_matches_extract_mode(meta, extract_mode):
-                    continue
-                if not _meta_is_current(meta, extract_mode):
-                    continue
-                for content_hash in content_hash_field.split(","):
-                    key = (wing, content_hash)
-                    if content_hash and key not in hashes:
-                        hashes[key] = src
-            if not batch["ids"]:
-                break
-            offset += len(batch["ids"])
+        for meta in _iter_all_metadata(collection):
+            meta = meta or {}
+            content_hash_field = meta.get("content_hash")
+            src = meta.get("source_file")
+            wing = meta.get("wing")
+            if not content_hash_field or not src or not wing:
+                continue
+            if not _metadata_matches_extract_mode(meta, extract_mode):
+                continue
+            if not _meta_is_current(meta, extract_mode):
+                continue
+            for content_hash in content_hash_field.split(","):
+                key = (wing, content_hash)
+                if content_hash and key not in hashes:
+                    hashes[key] = src
     except Exception:
         logger.warning("prefetch_content_hashes: partial fetch, %d hashes loaded", len(hashes))
     return hashes
