@@ -123,19 +123,34 @@ def tool_kg_add(
         },
     )
 
-    triple_id = _call_kg(
-        lambda kg: kg.add_triple(
-            subject,
-            predicate,
-            object,
-            valid_from=valid_from,
-            valid_to=valid_to,
-            source_closet=source_closet,
-            source_file=source_file,
-            source_drawer_id=source_drawer_id,
+    try:
+        triple_id = _call_kg(
+            lambda kg: kg.add_triple(
+                subject,
+                predicate,
+                object,
+                valid_from=valid_from,
+                valid_to=valid_to,
+                source_closet=source_closet,
+                source_file=source_file,
+                source_drawer_id=source_drawer_id,
+            )
         )
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    except Exception as e:
+        # Preserve the dispatcher-visible exception contract (tool_kg_add lets
+        # KG write errors bubble through _call_kg, which the MCP dispatcher
+        # turns into a -32000 response with context). Record the intent's
+        # outcome in the WAL before re-raising so the audit trail shows the
+        # error instead of a bare ``result: null``.
+        _wal_result("kg_add", {"success": False, "error": str(e)})
+        raise
+    outcome = {
+        "success": True,
+        "triple_id": triple_id,
+        "fact": f"{subject} → {predicate} → {object}",
+    }
+    _wal_result("kg_add", outcome)
+    return outcome
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -227,15 +242,35 @@ def tool_kg_supersede(
     }
 
 
-def tool_kg_timeline(entity: str = None):
-    """Get chronological timeline of facts, optionally for one entity."""
+def tool_kg_timeline(entity: str = None, limit: int = 100, offset: int = 0):
+    """Get chronological timeline of facts, optionally for one entity.
+
+    Paginated with ``limit``/``offset`` following the ``tool_list_drawers``
+    convention; defaults match the historical behavior (first 100 facts).
+    """
+    limit = max(1, min(limit, _MAX_RESULTS))
+    offset = max(0, offset)
     if entity is not None:
         try:
             entity = sanitize_kg_value(entity, "entity")
         except ValueError as e:
             return {"error": str(e)}
-    results = _call_kg(lambda kg: kg.timeline(entity))
-    return {"entity": entity or "all", "timeline": results, "count": len(results)}
+
+    def _query(kg):
+        return {
+            "timeline": kg.timeline(entity, limit=limit, offset=offset),
+            "total": kg.timeline_total(entity),
+        }
+
+    result = _call_kg(_query)
+    return {
+        "entity": entity or "all",
+        "timeline": result["timeline"],
+        "count": len(result["timeline"]),
+        "total": result["total"],
+        "offset": offset,
+        "limit": limit,
+    }
 
 
 def tool_kg_stats():

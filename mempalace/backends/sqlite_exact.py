@@ -23,6 +23,7 @@ from typing import Any, Optional
 
 import numpy as np
 
+from ._magic import has_sqlite_magic, read_header_fields
 from .base import (
     BackendClosedError,
     BackendError,
@@ -67,10 +68,6 @@ def _json_loads(text: str | None) -> dict:
     except json.JSONDecodeError:
         return {}
     return value if isinstance(value, dict) else {}
-
-
-def _encode_vector(vector: list[float]) -> bytes:
-    return _as_vector_array(vector).tobytes()
 
 
 def _as_vector_array(vector: list[float]) -> np.ndarray:
@@ -376,6 +373,53 @@ def sqlite_wing_room_counts(
                 dest = wing_rooms.setdefault(wkey, {})
                 dest[rkey] = dest.get(rkey, 0) + int(n)
             return total, wing_rooms
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return None
+
+
+def sqlite_wing_source_counts(palace_path: str, collection_name: str) -> Optional[list[tuple]]:
+    """Grouped ``(wing, source_file, n)`` for transcript-mined drawers, or ``None``.
+
+    Scoped to ``collection_name``: drawers and closets share the
+    ``documents`` table, and counting both would double every project.
+    Only rows whose ``source_file`` sits under a Claude Code projects
+    directory or a Codex sessions directory are returned; that is what
+    ``mempalace audit`` needs to see whether one wing mixes several
+    projects, and what ``wings split`` plans over.
+    """
+    db_path = os.path.join(palace_path, _DB_FILENAME)
+    if not os.path.isfile(db_path):
+        return None
+    try:
+        db_uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        conn = sqlite3.connect(db_uri, uri=True)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            row = conn.execute(
+                "SELECT id FROM collections WHERE name = ?", (collection_name,)
+            ).fetchone()
+            if row is None:
+                return None
+            wing_expr = (
+                "wing"
+                if _documents_has_locus_columns(conn)
+                else "json_extract(metadata_json, '$.wing')"
+            )
+            return list(
+                conn.execute(
+                    f"""
+                    SELECT {wing_expr}, json_extract(metadata_json, '$.source_file'), COUNT(*)
+                    FROM documents
+                    WHERE collection_id = ?
+                      AND (json_extract(metadata_json, '$.source_file') LIKE '%.claude%projects%'
+                           OR json_extract(metadata_json, '$.source_file') LIKE '%.codex%sessions%')
+                    GROUP BY 1, 2
+                    """,
+                    (int(row[0]),),
+                )
+            )
         finally:
             conn.close()
     except sqlite3.Error:
@@ -752,6 +796,29 @@ class SQLiteExactCollection(BaseCollection):
                 raise ValueError(f"{label} length {len(value)} does not match ids length {n}")
         with self._cursor(write=True) as cur:
             collection_id = self._collection_id(cur)
+            if documents is None and embeddings is None:
+                # Metadata-only update (a wing or room move): merge the JSON
+                # and leave the document, its embedding and its FTS row alone.
+                # Rewriting the FTS row per drawer made a 240k-row wing split
+                # run at ~1k rows/min; this path is one UPDATE per row.
+                now = _utcnow()
+                params = []
+                for idx, doc_id in enumerate(ids):
+                    row = cur.execute(
+                        "SELECT metadata_json FROM documents WHERE collection_id = ? AND id = ?",
+                        (collection_id, doc_id),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    meta = _json_loads(row[0])
+                    meta.update(metadatas[idx] or {})
+                    params.append((_json_dumps(meta), now, collection_id, doc_id))
+                cur.executemany(
+                    "UPDATE documents SET metadata_json = ?, updated_at = ? "
+                    "WHERE collection_id = ? AND id = ?",
+                    params,
+                )
+                return
             updates = []
             for idx, doc_id in enumerate(ids):
                 row = cur.execute(
@@ -787,7 +854,8 @@ class SQLiteExactCollection(BaseCollection):
                     """,
                     (doc, _json_dumps(meta), emb_blob, dim, _utcnow(), collection_id, doc_id),
                 )
-                self._replace_fts(cur, collection_id, doc_id, doc)
+                if documents is not None:
+                    self._replace_fts(cur, collection_id, doc_id, doc)
 
     def _rows(
         self,
@@ -1497,13 +1565,20 @@ class SQLiteExactBackend(BaseBackend):
     def _database_signature(db_path: str) -> tuple:
         """Detect completed writer/checkpoint cycles, even with unchanged size.
 
-        The SQLite header includes the change counter; stat identity and times
-        also detect replacement and updates between checkpoints. Never return a
-        cached snapshot after a failed filesystem read.
+        Stat identity and times detect replacement and updates between
+        checkpoints; the header fields SQLite exposes through pragmas
+        (schema cookie, page count, freelist count, user version, application
+        id) cover the page-1 changes a checkpoint can land without touching the
+        size. Never return a cached snapshot after a failed filesystem read.
+
+        The header is read through a throwaway ``immutable=1`` connection, not
+        a plain ``open()``: closing a non-SQLite descriptor on the database
+        drops every POSIX lock this process holds on it, including the SHARED
+        lock a sibling writer keeps for the life of its WAL connection. See
+        :mod:`mempalace.backends._magic`.
         """
         stat = os.stat(db_path)
-        with open(db_path, "rb") as database:
-            header = database.read(100)
+        header = read_header_fields(db_path)
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, header)
 
     @staticmethod
@@ -1872,15 +1947,16 @@ class SQLiteExactBackend(BaseBackend):
         behind because the SQLite header is written on the first statement,
         not on connection. The 16-byte ``SQLite format 3\\x00`` magic prefix
         accepts every real palace while rejecting empty / garbage files. See #1893.
+
+        The probe goes through :func:`mempalace.backends._magic.has_sqlite_magic`
+        and never opens a plain descriptor on the file: ``detect()`` runs on
+        nearly every MCP tool call, and closing a non-SQLite descriptor on the
+        database this backend already holds a WAL connection to drops every
+        POSIX lock the process owns on that inode -- including the SHARED lock
+        that stops an external ``close()`` from checkpointing and unlinking the
+        live ``-wal`` / ``-shm`` sidecars.
         """
-        db_path = os.path.join(path, _DB_FILENAME)
-        if not os.path.isfile(db_path):
-            return False
-        try:
-            with open(db_path, "rb") as f:
-                return f.read(16) == b"SQLite format 3\x00"
-        except OSError:
-            return False
+        return has_sqlite_magic(os.path.join(path, _DB_FILENAME))
 
     def create_collection(self, palace_path: str, collection_name: str) -> SQLiteExactCollection:
         return self.get_collection(palace_path, collection_name, create=True)
