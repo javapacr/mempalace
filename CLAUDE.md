@@ -20,6 +20,10 @@ fork-only enhancements are proven before promotion.
   land fixes for upstream's own breakage as clearly-labeled commits that are
   candidates for an upstream PR. Enhancement docs live linked from
   [docs/backlog.md](docs/backlog.md).
+- **Divergence inventory.** The current sync base, every fork-only item
+  (D-items), the collision recipes from the last sync, promotion candidates
+  and the fork-retirement tracker live in
+  [docs/upstream-sync.md](docs/upstream-sync.md). Update it on every sync.
 
 ## The Mission
 
