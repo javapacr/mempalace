@@ -35,9 +35,14 @@ Covers:
      adopted on qdrant at the d439d1e sync) instead of returning whatever
      was accumulated -- a partial dict reads as "not mined" / "no
      duplicate" and would let a mine re-file blind.
+  6. Chroma fallback (R11): after the fast scan fails, a real Chroma
+     palace keeps upstream's count()+offset paging, so even a
+     non-sqlite3.Error mid-scan still yields a complete registry with
+     iter_metadata attempted exactly once.
 """
 
 import logging
+import sqlite3
 import sys
 import types
 from typing import Optional
@@ -894,7 +899,7 @@ class TestScrollFailureRaisesMinedSetUnavailable:
 
         with pytest.raises(MinedSetUnavailable):
             prefetch_fn(col, extract_mode="exchange")
-        assert len(call_log) == 2, "the failing pass must be the single pass"
+        assert len(call_log) == 2, "no retry after the failure: exactly the one failing pass"
 
 
 # ---------------------------------------------------------------------------
@@ -981,3 +986,74 @@ class TestScopedPathCoexistsWithSinglePass:
 
         assert col.get_all_metadata_calls == 1
         assert col.get_calls == []
+
+
+# ---------------------------------------------------------------------------
+# 7. Chroma fallback keeps upstream's count()+offset paging (R11)
+# ---------------------------------------------------------------------------
+
+
+def _chroma_rows_palace(tmp_path):
+    """A real two-drawer Chroma palace, copied from test_miner's
+    _mined_rows_palace so this file stays standalone."""
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a", "b"],
+        documents=["a", "b"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[
+            {**current, "source_file": "/a", "source_mtime": 1.0, "content_hash": "ha"},
+            {**current, "source_file": "/b", "source_mtime": 2.0, "content_hash": "hb"},
+        ],
+    )
+    return col
+
+
+class TestChromaFallbackKeepsUpstreamPaging:
+    """After a failed fast scan, a real Chroma palace keeps upstream's
+    count()+offset paging in _paged_metadata (R11): even a non-sqlite3.Error
+    mid-scan must end in a complete registry -- not MinedSetUnavailable --
+    with iter_metadata attempted exactly once."""
+
+    @pytest.mark.parametrize("exc", [RuntimeError, OSError, sqlite3.OperationalError])
+    def test_failure_after_fast_scan_still_pages_to_a_complete_registry(
+        self, tmp_path, monkeypatch, exc
+    ):
+        from mempalace.backends.chroma import ChromaCollection
+
+        col = _chroma_rows_palace(tmp_path)
+        real = ChromaCollection.iter_metadata
+        iter_calls = []
+
+        def one_row_then_raise(self, keys=None, *, require_key=None):
+            iter_calls.append(keys)
+            rows = real(self, keys, require_key=require_key)
+
+            def gen():
+                try:
+                    yield next(rows)
+                    raise exc("injected mid-scan failure")
+                finally:
+                    # Release the SQLite reader before the fallback pages.
+                    rows.close()
+
+            return gen()
+
+        monkeypatch.setattr(ChromaCollection, "iter_metadata", one_row_then_raise)
+
+        assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+        assert len(iter_calls) == 1, "one prefetch call, one fast-scan attempt: no retry"
+        assert prefetch_content_hashes(col, extract_mode="exchange") == {
+            ("w", "ha"): "/a",
+            ("w", "hb"): "/b",
+        }
+        assert len(iter_calls) == 2, "each prefetch call attempts the fast scan exactly once"

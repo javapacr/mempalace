@@ -112,11 +112,29 @@ def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None)
 
 
 def _paged_metadata(collection):
-    """The non-Chroma fallback of :func:`_scan_collection_metadata`: one
-    :func:`_iter_all_metadata` pass (C9) instead of ``count()`` plus
-    ``get(limit, offset)`` pages, which re-scroll the collection from the
-    start on every page on materialize-then-slice backends (qdrant)."""
-    yield from _iter_all_metadata(collection)
+    """Fallback of :func:`_scan_collection_metadata` after the fast scan fails.
+
+    A Chroma collection keeps upstream's ``count()`` + offset pages:
+    Chroma's offset paging is a true server-side cursor, and the fast
+    sqlite scan just failed, so retrying it would be wasted I/O. Every
+    other backend gets one :func:`_iter_all_metadata` pass (C9), because
+    ``get(limit, offset)`` re-scrolls from the start on every page on
+    materialize-then-slice backends (qdrant).
+    """
+    from ..backends.chroma import ChromaCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if not isinstance(inner, ChromaCollection):
+        yield from _iter_all_metadata(collection)
+        return
+    total = collection.count()
+    offset = 0
+    while offset < total:
+        batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
+        yield from batch["metadatas"]
+        if not batch["ids"]:
+            break
+        offset += len(batch["ids"])
 
 
 def file_already_mined(
