@@ -962,6 +962,56 @@ def test_convo_chunker_version_only_gates_the_exchange_scope():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_prefetch_scans_read_chroma_sqlite_instead_of_paging(tmp_path, monkeypatch):
+    """Both whole-collection prefetches stream chroma.sqlite3: Chroma's
+    count() loads the HNSW index and its get(offset) paging is quadratic."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import get_collection, prefetch_content_hashes
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a0", "a1", "b0", "stale"],
+        documents=["a zero", "a one", "b zero", "old"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1], [0.3, 0.3], [0.4, 0.1]],
+        metadatas=[
+            {
+                **current,
+                "source_file": "/a",
+                "source_mtime": 1.0,
+                "chunk_total": 2,
+                "content_hash": "ha",
+            },
+            {**current, "source_file": "/a", "source_mtime": 1.0, "chunk_total": 2},
+            {
+                **current,
+                "source_file": "/b",
+                "source_mtime": 2.0,
+                "chunk_total": 1,
+                "content_hash": "hb",
+            },
+            {**current, "source_file": "/c", "convo_chunker_version": 1, "content_hash": "hc"},
+        ],
+    )
+
+    def _no_paging(*_a, **_k):
+        raise AssertionError("paged through Chroma instead of reading chroma.sqlite3")
+
+    monkeypatch.setattr(ChromaCollection, "count", _no_paging)
+    monkeypatch.setattr(ChromaCollection, "get", _no_paging)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+    assert prefetch_content_hashes(col, extract_mode="exchange") == {
+        ("w", "ha"): "/a",
+        ("w", "hb"): "/b",
+    }
+
+
 def test_file_already_mined_extract_mode_paginates_large_sources():
     source_file = "/tmp/long-chat.jsonl"
     metadatas = [
@@ -3183,3 +3233,283 @@ def test_a_directory_that_cannot_be_statted_still_mines(tmp_path, monkeypatch):
 
     assert col.metadatas, "a directory with no identity stopped the mine"
     assert all("source_dir_ino" not in m for m in col.metadatas), col.metadatas
+
+
+def test_project_mine_reaches_a_yield_point_before_each_file(tmp_path):
+    from mempalace.palace import mine_yield_hook
+
+    project_root = tmp_path / "proj"
+    for n in range(3):
+        write_file(project_root / "backend" / f"mod{n}.py", f"def f{n}():\n    return {n}\n" * 20)
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "proj", "rooms": [{"name": "backend", "description": "code"}]}, f)
+    calls: list = []
+    with mine_yield_hook(lambda: calls.append(1)):
+        mine(str(project_root), str(tmp_path / "palace"))
+    assert len(calls) == 3
+
+
+def test_metadata_scan_reads_a_schema_without_bool_value():
+    """Older chromadb schemas predate bool_value; the scan reads the columns
+    the table has instead of failing on the missing one."""
+    import sqlite3
+
+    from mempalace.backends.chroma import _sqlite_iter_metadata
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT, name TEXT);
+            CREATE TABLE segments (id TEXT, collection TEXT, scope TEXT);
+            CREATE TABLE embeddings (id INTEGER PRIMARY KEY, segment_id TEXT);
+            CREATE TABLE embedding_metadata
+              (id INTEGER, key TEXT, string_value TEXT, int_value INTEGER, float_value REAL);
+            INSERT INTO collections VALUES ('c', 'drawers');
+            INSERT INTO segments VALUES ('s', 'c', 'METADATA');
+            INSERT INTO embeddings VALUES (1, 's');
+            INSERT INTO embedding_metadata VALUES (1, 'source_file', '/old.md', NULL, NULL);
+            INSERT INTO embedding_metadata VALUES (1, 'chunk_total', NULL, 3, NULL);
+            """
+        )
+        rows = list(_sqlite_iter_metadata(conn, "drawers", ["source_file", "chunk_total"], None))
+    assert rows == [{"source_file": "/old.md", "chunk_total": 3}]
+
+
+def _mined_rows_palace(tmp_path):
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    current = {
+        "wing": "w",
+        "extract_mode": "exchange",
+        "ingest_mode": "convos",
+        "normalize_version": NORMALIZE_VERSION,
+        "convo_chunker_version": CONVO_CHUNKER_VERSION,
+    }
+    col.add(
+        ids=["a", "b"],
+        documents=["a", "b"],
+        embeddings=[[0.1, 0.2], [0.2, 0.1]],
+        metadatas=[
+            {**current, "source_file": "/a", "source_mtime": 1.0, "content_hash": "ha"},
+            {**current, "source_file": "/b", "source_mtime": 2.0, "content_hash": "hb"},
+        ],
+    )
+    return col
+
+
+def test_prefetch_discards_a_failed_fast_scan_and_pages_instead(tmp_path, monkeypatch):
+    """A fast scan that fails after some rows must not leave a partial
+    registry: it reads as "not mined" and "no duplicate"."""
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import prefetch_content_hashes
+
+    col = _mined_rows_palace(tmp_path)
+    real = ChromaCollection.iter_metadata
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        rows = real(self, keys, require_key=require_key)
+
+        def gen():
+            try:
+                yield next(rows)
+                raise sqlite3.OperationalError("injected mid-scan failure")
+            finally:
+                # Release the SQLite reader before Chroma's fallback needs to write.
+                rows.close()
+
+        return gen()
+
+    import sqlite3
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_mined_set(col, extract_mode="exchange") == {"/a": 1.0, "/b": 2.0}
+    assert prefetch_content_hashes(col, extract_mode="exchange") == {
+        ("w", "ha"): "/a",
+        ("w", "hb"): "/b",
+    }
+
+
+def test_prefetch_raises_when_no_complete_scan_is_possible(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.palace import MinedSetUnavailable, prefetch_content_hashes
+
+    col = _mined_rows_palace(tmp_path)
+
+    def broken(*_a, **_k):
+        yield {"source_file": "/a"}
+        raise sqlite3.OperationalError("injected failure")
+
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", broken)
+    monkeypatch.setattr(palace_pkg, "_paged_metadata", broken)
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_mined_set(col, extract_mode="exchange")
+    with pytest.raises(MinedSetUnavailable):
+        prefetch_content_hashes(col, extract_mode="exchange")
+
+
+def _prefetch_cases_palace(tmp_path):
+    """One file per case, with the drawers each case stores for it."""
+    from mempalace.palace import get_collection
+
+    col = get_collection(str(tmp_path / "palace"), create=True)
+    paths = {}
+    for name in (
+        "complete",
+        "legacy",
+        "sentinel",
+        "two_groups",
+        "drift",
+        "changed",
+        "partial",
+        "stale_version",
+        "no_mtime",
+        "old_sentinel",
+        "mixed_totals",
+        "text_total",
+        "missing",
+    ):
+        path = tmp_path / "src" / f"{name}.md"
+        write_file(path, f"{name} content")
+        paths[name] = str(path)
+    mtime = {name: os.path.getmtime(path) for name, path in paths.items()}
+    current = {"normalize_version": NORMALIZE_VERSION}
+
+    def drawers(name, n, **meta):
+        return [{**current, "source_file": paths[name], **meta} for _ in range(n)]
+
+    rows = [
+        *drawers("complete", 2, source_mtime=mtime["complete"], chunk_total=2),
+        *drawers("legacy", 1, source_mtime=mtime["legacy"]),
+        # The convo miner's registry row: no chunk_total, trusted on its own.
+        *drawers(
+            "sentinel",
+            1,
+            source_mtime=mtime["sentinel"],
+            room="_registry",
+            ingest_mode="registry",
+            extract_mode="exchange",
+        ),
+        # An older complete pass next to the current one (additive mining).
+        *drawers("two_groups", 1, source_mtime=mtime["two_groups"] - 50, chunk_total=1),
+        *drawers("two_groups", 3, source_mtime=mtime["two_groups"], chunk_total=3),
+        *drawers("drift", 1, source_mtime=mtime["drift"] + 0.0005, chunk_total=1),
+        *drawers("changed", 1, source_mtime=mtime["changed"] - 10, chunk_total=1),
+        # A crash between upsert batches: 2 of 3 chunks.
+        *drawers("partial", 2, source_mtime=mtime["partial"], chunk_total=3),
+        {
+            "normalize_version": NORMALIZE_VERSION - 1,
+            "source_file": paths["stale_version"],
+            "source_mtime": mtime["stale_version"],
+            "chunk_total": 1,
+        },
+        *drawers("no_mtime", 1, chunk_total=1),
+        *drawers(
+            "old_sentinel",
+            1,
+            source_mtime=mtime["old_sentinel"] - 10,
+            room="_registry",
+            ingest_mode="registry",
+        ),
+        # Two drawers naming different totals: file_already_mined's answer
+        # depends on the order Chroma returns them in.
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=2),
+        *drawers("mixed_totals", 1, source_mtime=mtime["mixed_totals"], chunk_total=3),
+        # A string total makes file_already_mined's comparison raise -> False.
+        *drawers("text_total", 1, source_mtime=mtime["text_total"], chunk_total="1"),
+    ]
+    col.add(
+        ids=[f"d{i}" for i in range(len(rows))],
+        documents=[f"doc {i}" for i in range(len(rows))],
+        embeddings=[[0.1 * (i % 7), 0.2] for i in range(len(rows))],
+        metadatas=rows,
+    )
+    return col, paths
+
+
+def test_prefetch_complete_mtimes_never_skips_a_file_the_per_file_check_would_mine(tmp_path):
+    from mempalace.miner import _prefetched_as_mined
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+    mined_mtimes = prefetch_complete_mtimes(col, list(paths.values()))
+
+    fast = {name for name, path in paths.items() if _prefetched_as_mined(path, mined_mtimes)}
+    per_file = {
+        name for name, path in paths.items() if file_already_mined(col, path, check_mtime=True)
+    }
+    assert fast <= per_file
+    assert fast == {"complete", "legacy", "sentinel", "two_groups", "drift"}
+    assert per_file - {"mixed_totals"} == fast
+
+    # Sources outside this mine's file list are not tracked.
+    assert set(prefetch_complete_mtimes(col, [paths["complete"]])) == {paths["complete"]}
+
+    # A file edited since it was filed is no longer proven mined.
+    os.utime(paths["complete"], (0, os.path.getmtime(paths["complete"]) + 5))
+    assert not _prefetched_as_mined(paths["complete"], mined_mtimes)
+    assert file_already_mined(col, paths["complete"], check_mtime=True) is False
+
+
+def test_prefetch_complete_mtimes_gives_up_without_a_complete_sqlite_scan(tmp_path, monkeypatch):
+    import sqlite3
+
+    import mempalace.palace as palace_pkg
+    from mempalace.backends.chroma import ChromaCollection
+    from mempalace.palace import prefetch_complete_mtimes
+
+    col, paths = _prefetch_cases_palace(tmp_path)
+
+    def breaks_after_one_row(self, keys=None, *, require_key=None):
+        def gen():
+            yield {"source_file": paths["complete"], "normalize_version": NORMALIZE_VERSION}
+            raise sqlite3.OperationalError("injected failure")
+
+        return gen()
+
+    monkeypatch.setattr(ChromaCollection, "iter_metadata", breaks_after_one_row)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+    # A backend without the sqlite stream keeps the per-file check.
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    assert prefetch_complete_mtimes(col, list(paths.values())) is None
+
+
+def test_mine_skips_prefetched_files_without_a_per_file_query(tmp_path, monkeypatch):
+    import mempalace.miner as miner_mod
+    import mempalace.palace as palace_pkg
+
+    project_root = tmp_path / "proj"
+    _make_minable_project(project_root, n_files=3)
+    palace_path = str(tmp_path / "palace")
+    mine(str(project_root), palace_path)
+
+    asked = []
+    real_check = miner_mod.file_already_mined
+
+    def recording_check(collection, source_file, **kwargs):
+        asked.append(Path(source_file).name)
+        return real_check(collection, source_file, **kwargs)
+
+    monkeypatch.setattr(miner_mod, "file_already_mined", recording_check)
+
+    # Nothing changed: every file is skipped from the prefetched map.
+    mine(str(project_root), palace_path)
+    assert asked == []
+
+    # An edited file falls through to the per-file check and is re-mined;
+    # the unchanged ones are still skipped without a query.
+    edited = project_root / "f1.py"
+    os.utime(edited, (0, os.path.getmtime(edited) + 5))
+    mine(str(project_root), palace_path)
+    assert asked == ["f1.py", "f1.py"]  # the pre-lock check and the in-lock re-check
+    assert real_check(palace_pkg.get_collection(palace_path), str(edited), check_mtime=True)
+
+    # Without the sqlite stream every file takes the per-file check, and
+    # is still skipped.
+    asked.clear()
+    monkeypatch.setattr(palace_pkg, "_fast_collection_metadata", lambda *_a, **_k: None)
+    mine(str(project_root), palace_path)
+    assert sorted(asked) == ["f0.py", "f1.py", "f2.py"]
