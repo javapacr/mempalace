@@ -29,6 +29,29 @@ os.environ["USERPROFILE"] = _session_tmp
 os.environ["HOMEDRIVE"] = os.path.splitdrive(_session_tmp)[0] or "C:"
 os.environ["HOMEPATH"] = os.path.splitdrive(_session_tmp)[1] or _session_tmp
 
+# Backend selection and palace targeting must come from the tests themselves,
+# never the shell. ANY developer-exported MEMPALACE_* var would otherwise leak
+# into the suite: MEMPALACE_BACKEND / MEMPALACE_BACKEND_EXPLICIT route every
+# test mine through a non-chroma backend, leaving tests that open a raw
+# chromadb.PersistentClient unable to find the collection, and
+# MEMPALACE_PALACE_PATH / MEMPALACE_QDRANT_NAMESPACE could redirect
+# default-palace lookups at the user's real palace. Scrub every MEMPALACE_*
+# var unconditionally — this is the single centralized choke point. Tests that
+# exercise env-driven selection set/del specific vars themselves (monkeypatch)
+# after this point, which is unaffected by this scrub; the session-finish
+# fixture below restores the originals from _original_env.
+for _var in [k for k in list(os.environ) if k.startswith("MEMPALACE_")]:
+    _original_env[_var] = os.environ[_var]
+    os.environ.pop(_var, None)
+
+# Config-dir resolution is XDG-aware (mempalace/config.py): an exported
+# XDG_CONFIG_HOME outranks the redirected HOME above and would point the
+# default config -- and so the default palace path and backend detection --
+# at the user's real ~/.config/mempalace. Scrub it with the same restore
+# contract so default lookups stay under the throwaway HOME.
+if "XDG_CONFIG_HOME" in os.environ:
+    _original_env["XDG_CONFIG_HOME"] = os.environ.pop("XDG_CONFIG_HOME")
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
@@ -305,9 +328,10 @@ def _reset_mcp_cache(monkeypatch):
 def _isolate_home():
     """Ensure HOME points to a temp dir for the entire test session.
 
-    The env vars were already set at module level (above) so that
-    module-level initialisations are captured.  This fixture simply
-    restores the originals on teardown and cleans up the temp dir.
+    The env vars were already set (and the backend-selection vars popped)
+    at module level (above) so that module-level initialisations are
+    captured.  This fixture simply restores the originals on teardown and
+    cleans up the temp dir.
     """
     yield
     for var, orig in _original_env.items():
