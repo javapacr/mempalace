@@ -41,7 +41,7 @@ You have access to a local memory palace via MCP tools. The palace stores verbat
 1. **ON WAKE-UP**: Call `mempalace_status` to load palace overview and AAAK dialect spec.
 2. **BEFORE RESPONDING** about any person, project, or past event: use `mempalace_kg_query` for known relationships or time-bound facts, `mempalace_search` for source text, or `mempalace_diary_read` for recent agent continuity. Stop when answered; follow the canonical [query guide](https://github.com/MemPalace/mempalace/blob/develop/integrations/shared/recall-protocol.md#retrieve-only-the-context-you-need). Never guess from memory — verify from the palace.
 3. **IF UNSURE** about a fact (name, age, relationship, preference): say "let me check" and query. Wrong is worse than slow.
-4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters.
+4. **AFTER EACH SESSION**: Call `mempalace_diary_write` to record what happened, what you learned, what matters. If the session's work is anchored in a long-lived repo (anchor/monorepo you return to across sessions), file the diary to that repo's wing — `wing=<repo-wing>` (e.g. `pi-mempalace-github`, `pi-extensions`); keep personal or cross-repo entries in your agent wing.
 5. **WHEN FACTS CHANGE**: Call `mempalace_kg_invalidate` on the old fact, then `mempalace_kg_add` for the new one.
 
 ## Available Tools
