@@ -47,3 +47,6 @@ target/
 *.dylib
 *.exe
 
+
+# Repo-local MCP palace scratch
+.mcp-palace/

@@ -1,0 +1,44 @@
+version: "3"
+
+tasks:
+  sync-upstream:
+    desc: Fetch upstream and rebase the fork's patch stack onto upstream/develop (no push)
+    cmds:
+      - git fetch upstream --prune
+      # Rebases the D-item stack; --autosquash folds fixup! commits (the
+      # rebase.autoSquash config only takes effect in interactive mode; the
+      # --autosquash flag works non-interactively). If upstream/develop was rewritten so the old stack base is not
+      # its ancestor, the plain rebase may replay stale upstream commits or
+      # conflict: run git rebase --onto <new-up> <old-base> by hand instead
+      # (docs/upstream-sync.md).
+      - "git rebase --autosquash upstream/develop || (git rebase --abort && exit 1)"
+
+  install:
+    desc: Sync deps + native Rust ext + mempalace into mise Python 3.13, verify
+    sources:
+      - mempalace/**/*.py
+      - crates/**/*.rs
+      - crates/*/Cargo.toml
+      - crates/mempalace-py/pyproject.toml
+      - pyproject.toml
+    vars:
+      PYTHON: >-
+        /Users/reevonr/.local/share/mise/installs/python/3.13/bin/python3.13
+    cmds:
+      # Pull any deps added by upstream syncs (fast no-op when current)
+      - "uv pip install --python {{.PYTHON}} -r pyproject.toml"
+      - >-
+        uv pip install --python {{.PYTHON}} --force-reinstall --no-deps
+        {{.ROOT_DIR}}
+      # Native Rust exact-search ext (optional; skips without cargo)
+      - >-
+        sh -c 'if command -v cargo >/dev/null 2>&1; then
+        uv pip install --force-reinstall --python {{.PYTHON}}
+        ./crates/mempalace-py;
+        else echo "skip native ext: no cargo (python fallback)"; fi'
+      - "{{.PYTHON}} -m mempalace --version"
+      - >-
+        sh -c 'if {{.PYTHON}} -c "from mempalace.backends.rust_exact import
+        _NativeVectorIndex as N; assert N" 2>/dev/null;
+        then echo "native extension: OK";
+        else echo "native extension: ABSENT (python fallback)"; fi'
