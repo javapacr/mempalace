@@ -63,6 +63,18 @@ _PAYLOAD_METADATA = "metadata"
 _KEYWORD_PAYLOAD_FIELDS = ("wing", "room", "source_file")
 # IDs per has_id request when fetching vectors for locally matched points.
 _VECTOR_ID_BATCH = 1024
+
+# Payload fields filtered on hot operations (project-mine skip checks,
+# in-lock rechecks, stale-drawer purges) and on facet listings (wing/room
+# counts: without an index each facet call scans server-side -- ~50 scans
+# per status on a ~50-wing collection; with them facets are ms). Without
+# an index qdrant full-scans the collection for every filtered query.
+# Field paths mirror _condition()'s f"{_PAYLOAD_METADATA}.{field}" keys.
+# Derived from _KEYWORD_PAYLOAD_FIELDS (the indexes created with a new
+# collection) so adoption on pre-existing collections can never drift from it.
+_FILTER_INDEX_FIELDS: tuple[tuple[str, str], ...] = tuple(
+    (f"{_PAYLOAD_METADATA}.{field}", "keyword") for field in _KEYWORD_PAYLOAD_FIELDS
+)
 _POINT_NAMESPACE = uuid.UUID("c06c3fc7-5c14-4dc4-84c2-24a5f72d8dc1")
 # Page size for Qdrant's /points/scroll cursor. 4096 (up from the original
 # 256) cuts REST round-trips ~16x for any full-collection walk.
@@ -248,12 +260,14 @@ class _QdrantRESTClient:
             body={"vectors": {"size": int(dimension), "distance": "Cosine"}},
         )
 
-    def create_payload_index(self, collection: str, field_name: str, field_schema: str) -> None:
+    def create_payload_index(
+        self, collection: str, field_name: str, field_schema: str, *, wait: bool = True
+    ) -> None:
         try:
             self.request(
                 "PUT",
                 f"/collections/{urlparse.quote(collection, safe='')}/index",
-                query={"wait": "true"},
+                query={"wait": "true" if wait else "false"},
                 body={"field_name": field_name, "field_schema": field_schema},
             )
         except _QdrantHTTPError as exc:
@@ -261,6 +275,27 @@ class _QdrantRESTClient:
                 logger.debug("Qdrant payload index creation skipped: %s", exc)
                 return
             raise
+
+    def list_payload_indexes(self, collection: str) -> list[str]:
+        """Return the payload index field paths that exist on a collection.
+
+        qdrant has NO list-index endpoint in any version (only PUT/DELETE
+        ``/index``; ``GET /collections/{n}/indexes`` is 404 -- verified live
+        against 1.18.3). Created payload indexes are reported in the
+        collection info response instead, as ``result.payload_schema``: a
+        dict keyed by field path --
+        {"metadata.source_file": {"data_type": "keyword", ...}, ...} --
+        exactly the paths create_payload_index() was called with. Used to
+        make filter-index creation a once-per-collection event: create only
+        what payload_schema says is missing, so steady-state opens issue
+        zero creation calls.
+        """
+        info = self.get_collection_info(collection)
+        result = info.get("result") or info
+        schema = result.get("payload_schema") or {}
+        if not isinstance(schema, dict):
+            return []
+        return [name for name in schema if isinstance(name, str)]
 
     def upsert_points(self, collection: str, points: list[dict]) -> None:
         self.request(
@@ -546,6 +581,10 @@ class QdrantCollection(BaseCollection):
         self._closed = False
         self._known_dimension: Optional[int] = None
         self._scroll_cursor: Optional[_QdrantScrollCursor] = None
+        # Reconciled-once guard for this object: True once server-side index
+        # state has been checked. The once-per-COLLECTION memory is the index
+        # list on the qdrant server itself, not this flag.
+        self._filter_indexes_checked = False
 
     def _invalidate_scroll_cursor(self) -> None:
         with self._lock:
@@ -554,6 +593,63 @@ class QdrantCollection(BaseCollection):
     def _ensure_open(self) -> None:
         if self._closed or self._backend._closed:
             raise BackendClosedError("QdrantCollection has been closed")
+        self._ensure_filter_indexes()
+
+    def _ensure_filter_indexes(self) -> None:
+        """Ensure payload indexes on hot filter fields -- once per collection, ever.
+
+        Project-mine skip checks (``file_already_mined``), in-lock rechecks,
+        and stale-drawer purges filter on ``metadata.source_file``; on an
+        unindexed payload field qdrant full-scans the collection for every
+        such query (~5-9s per file at CVP scale). Indexes change execution
+        plans only, never results.
+
+        The qdrant server is the once-only memory: each collection object
+        checks the server's index list at most once and creates only what
+        the listing says is missing. After the first adoption open, every
+        later open -- any process, any host -- sees the index listed and
+        issues zero creation calls. Deliberately on the OPEN path rather
+        than the write-path ``_ensure_remote_collection``: a fully-warm
+        mine never upserts, so write-path ensure alone would never index an
+        existing collection. Index builds run asynchronously server-side,
+        so this never blocks the caller, and any failure degrades to
+        today's unindexed scans with a warning -- never a failed mine.
+
+        Post-adoption, a ``grey`` collection status is NORMAL, not a fault:
+        grey is a latch, not an error state -- reads, filters, and facet
+        listings all work while grey, and it clears on the next
+        write-driven optimizer tick (BRD P1 evidence E6, observed live).
+        """
+        if self._filter_indexes_checked:
+            return
+        self._filter_indexes_checked = True
+        if not self._remote_exists():
+            return
+        try:
+            existing = set(self._client.list_payload_indexes(self._remote_collection))
+        except Exception as exc:  # noqa: BLE001 - degrade to unindexed scans
+            logger.warning(
+                "qdrant: could not list payload indexes on %s: %s",
+                self._remote_collection,
+                exc,
+            )
+            return
+        for field, schema in _FILTER_INDEX_FIELDS:
+            if field in existing:
+                continue
+            # wait=False: index builds run asynchronously server-side and can
+            # take minutes on large collections (458k-point drawers
+            # collection), so a blocking PUT client-times-out on every
+            # first-adoption open against the default 10s timeout. The PUT
+            # returns once accepted; list_payload_indexes() (payload_schema)
+            # already reports the field, so the once-per-collection ensure
+            # never re-creates.
+            try:
+                self._client.create_payload_index(
+                    self._remote_collection, field, schema, wait=False
+                )
+            except Exception as exc:  # noqa: BLE001 - degrade to unindexed scans
+                logger.warning("qdrant: could not ensure payload index on %s: %s", field, exc)
 
     def _remote_exists(self) -> bool:
         return self._client.collection_exists(self._remote_collection)
