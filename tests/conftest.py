@@ -69,6 +69,13 @@ for _var in [
 ]:
     _original_env[_var] = os.environ.pop(_var)
 
+# Config-dir resolution is XDG-aware (mempalace/paths.py): an exported
+# XDG_CONFIG_HOME outranks the redirected HOME above and would point the
+# default config at the user's real ~/.config/mempalace. Scrub it with the
+# same restore contract so default lookups stay under the throwaway HOME.
+if "XDG_CONFIG_HOME" in os.environ:
+    _original_env["XDG_CONFIG_HOME"] = os.environ.pop("XDG_CONFIG_HOME")
+
 # Now it is safe to import mempalace modules that trigger initialisation.
 import chromadb  # noqa: E402
 import pytest  # noqa: E402
