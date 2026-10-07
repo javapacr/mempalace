@@ -66,7 +66,11 @@ metadata:
    before recording continuity; use light `FILED` or full
    `mempalace_memories_filed_away` when needed.
    If not already saved, use a diary entry or a checkpoint combining verbatim
-   items with agent continuity. Consult light `AAAK SPEC` or full
+   items with agent continuity. If the session's work is anchored in a long-lived
+   repo (anchor/monorepo you return to across sessions), file the diary to that
+   repo's wing — `wing=<repo-wing>` (e.g. `pi_mempalace_github`,
+   `pi_extensions`); keep personal or cross-repo entries in your agent wing.
+   Consult light `AAAK SPEC` or full
    `mempalace_get_aaak_spec` for diary notation; compressed observations never
    replace verbatim source drawers. Confirm the save or report failure.
 
