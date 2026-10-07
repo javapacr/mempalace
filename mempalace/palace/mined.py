@@ -112,6 +112,21 @@ def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None)
 
 
 def _paged_metadata(collection):
+    """Fallback of :func:`_scan_collection_metadata` after the fast scan fails.
+
+    A Chroma collection keeps upstream's ``count()`` + offset pages:
+    Chroma's offset paging is a true server-side cursor, and the fast
+    sqlite scan just failed, so retrying it would be wasted I/O. Every
+    other backend gets one :func:`_iter_all_metadata` pass (C9), because
+    ``get(limit, offset)`` re-scrolls from the start on every page on
+    materialize-then-slice backends (qdrant).
+    """
+    from ..backends.chroma import ChromaCollection
+
+    inner = collection._inner if isinstance(collection, EmbeddingCollection) else collection
+    if not isinstance(inner, ChromaCollection):
+        yield from _iter_all_metadata(collection)
+        return
     total = collection.count()
     offset = 0
     while offset < total:
@@ -222,6 +237,38 @@ def file_already_mined(
         return False
     except Exception:
         return False
+
+
+def _page_all_metadata_via_get(collection) -> list[dict]:
+    """Offset-page a bulk metadata fetch for collections that predate the
+    ``get_all_metadata`` contract method (#1796) -- e.g. a raw chromadb
+    ``Collection``, which exposes only count()/get(). Same loop shape as
+    BaseCollection.get_all_metadata's default and mcp_server's
+    _fetch_all_metadata fallback: on such backends get(limit=, offset=)
+    has a true server-side cursor, so this is linear, just not the
+    single-cursor pass overriding backends provide."""
+    all_meta: list[dict] = []
+    offset = 0
+    page_size = 1000
+    while True:
+        batch = collection.get(limit=page_size, offset=offset, include=["metadatas"])
+        batch_meta = batch.metadatas if hasattr(batch, "metadatas") else batch.get("metadatas")
+        if not batch_meta:
+            break
+        all_meta.extend(batch_meta)
+        if len(batch_meta) < page_size:
+            break
+        offset += len(batch_meta)
+    return all_meta
+
+
+def _iter_all_metadata(collection):
+    """One bulk metadata pass for the prefetch helpers (C9): the
+    ``get_all_metadata`` contract method when the collection has it, else
+    :func:`_page_all_metadata_via_get`."""
+    if hasattr(collection, "get_all_metadata"):
+        return collection.get_all_metadata()
+    return _page_all_metadata_via_get(collection)
 
 
 # Above this many candidate files, one filtered get costs more round trips
