@@ -7,11 +7,12 @@ is updated on every sync.
 
 | | |
 | --- | --- |
-| Sync base (upstream/develop) | `8c4865f` (v3.10.0) |
-| Previous sync base | `238ca21` |
-| Synced on | 2026-09-26, branch `chore/sync-upstream-8c4865f` |
-| Merge commit | `b092219 merge: sync upstream/develop (238ca21..8c4865f)` |
-| Transplant / fix commits | `3802060` (inv-D5, C3), `07d18f6` (inv-D4 guard, C1), `17bd277` (inv-D6 tests, C5), `ccfdbd7` (inv-D7 extension) |
+| Sync base (upstream/develop) | `d439d1e` (v3.11.0+) |
+| Previous sync base | `8c4865f` |
+| Synced on | 2026-10-07, branch `chore/sync-upstream-d439d1e` |
+| Merge commit | `070e035 merge: sync upstream/develop (8c4865f..d439d1e)` |
+| Transplant / fix commits | `c74b4d2` (inv-D5, C6), `a1b9297` (inv-D6, C7) |
+| Gates (W1 tree) | pytest 0 failed, coverage 83.99% (floor 83.43%, intent decision D7), rc=0; `ruff check .` rc=0; `ruff format --check .` rc=0 |
 
 ## Divergence inventory (D-items)
 
@@ -19,27 +20,38 @@ The status column records each item **as landed** at the sync base above.
 
 | D | Divergence | Fork commits | Status after this sync | Where it lives now |
 | --- | --- | --- | --- | --- |
-| D1 | Qdrant `get()` limit pushdown | 4d65cd2 | **Superseded** by upstream 720f3d8 (`_scroll_all(max_rows=)`). The guard test is kept. | `tests/test_qdrant_limit_pushdown.py` (guard, green) |
-| D2 | Qdrant payload indexes on `metadata.source_file` / `wing` / `room`, adopted non-blocking (`wait=false`) | 4534c57, 05ae8ec, 3ea194a, b2a74a5 | **Fork-only** | `mempalace/backends/qdrant.py` (`_FILTER_INDEX_FIELDS`, `_ensure_filter_indexes`, `create_payload_index`), `tests/test_qdrant_filter_indexes.py` |
-| D3 | CLI status: `get_all_metadata` fast path + facet-backed wing/room counts | a37602a, 55e13bd, 22484cc | Fast path **upstreamed** (d27e515). Facet path (inv-D3-facet) is **fork-only**. | `mempalace/miner.py` `status()` (facet block ahead of the shared fast path), `tests/test_cli_status_fast_path.py` |
-| D4 | L1 wake-up single-pass candidate fetch | 6cdc5e4 | **Superseded** by upstream 0da09a2 (`BaseCollection.get_recent`). The guard is retargeted to the `get_recent` contract. | `tests/test_l1_wake_up_fast_path.py` (guard) |
-| D5 | Bulk prefetch single pass (C9): `prefetch_mined_set` / `prefetch_content_hashes` via `get_all_metadata` | 8c25220 → 3802060 | **Fork-only**. Now lives in `palace/mined.py`, under upstream's #2567 scoping. | `mempalace/palace/mined.py`, `tests/test_prefetch_single_pass.py` |
-| D6 | Repo-wing diary hint (protocol rule 4 + diary_write tool help) | 93204dc, 0a6c66a → 17bd277 | **Fork-only**. Its tests moved to `tests/mcp/test_protocol.py`. | `mcp_server/{schemas,tools_read,tools_diary}.py`, `integrations/openclaw/SKILL.md`, `tests/mcp/test_protocol.py::TestHandleRequest` |
-| D7 | Hermetic test env: scrub every `MEMPALACE_*` var, plus `XDG_CONFIG_HOME` (added this sync) | 0727958, 020109a, ccfdbd7 | **Fork-only** | `tests/conftest.py` |
+| D1 | Qdrant `get()` limit pushdown | 4d65cd2 | **Superseded** by upstream 720f3d8 (`_scroll_all(max_rows=)`); untouched this sync. The guard test is kept. | `tests/test_qdrant_limit_pushdown.py` (guard, green) |
+| D2 | Qdrant payload indexes on `metadata.source_file` / `wing` / `room`, adopted non-blocking (`wait=false`) | 4534c57, 05ae8ec, 3ea194a, b2a74a5 | **Fork-only**, untouched this sync. | `mempalace/backends/qdrant.py` (`_FILTER_INDEX_FIELDS`, `_ensure_filter_indexes`, `create_payload_index`), `tests/test_qdrant_filter_indexes.py` |
+| D3 | CLI status: `get_all_metadata` fast path + facet-backed wing/room counts | a37602a, 55e13bd, 22484cc | Fast path **upstreamed** (d27e515). Facet path (inv-D3-facet) is **fork-only**, untouched this sync. | `mempalace/miner.py` `status()` (facet block ahead of the shared fast path), `tests/test_cli_status_fast_path.py` |
+| D4 | L1 wake-up single-pass candidate fetch | 6cdc5e4 | **Superseded** by upstream 0da09a2 (`BaseCollection.get_recent`); untouched this sync. The guard is retargeted to the `get_recent` contract. | `tests/test_l1_wake_up_fast_path.py` (guard) |
+| D5 | Bulk prefetch single pass (C9): `prefetch_mined_set` / `prefetch_content_hashes` via `get_all_metadata` | 8c25220 → 3802060 → c74b4d2 | **Fork-only**. Re-applied (C6) under upstream's `_scan_collection_metadata`: the non-Chroma fallback `_paged_metadata` is one `_iter_all_metadata` pass, and Chroma uses upstream's sqlite stream. Contract adopted on qdrant: a failed registry read raises `MinedSetUnavailable` instead of returning a partial dict. | `mempalace/palace/mined.py`, `tests/test_prefetch_single_pass.py` |
+| D6 | Repo-wing diary hint (protocol rule 4 + diary_write tool help) | 93204dc, 0a6c66a → 17bd277 → a1b9297 | **Fork-only**, intact after C7. Its tests moved to `tests/mcp/test_protocol.py`. | `mcp_server/{schemas,tools_read,tools_diary}.py`, `integrations/openclaw/SKILL.md`, `tests/mcp/test_protocol.py::TestHandleRequest` |
+| D7 | Hermetic test env: scrub every `MEMPALACE_*` var, plus `XDG_CONFIG_HOME` (added in the 8c4865f sync, ccfdbd7) | 0727958, 020109a, ccfdbd7 | **Fork-only**, untouched this sync. | `tests/conftest.py` |
 | D8 | Fork docs + tooling: BRDs, backlog, CLAUDE.md intent, this doc, Taskfile, lens suppression | 8613376, 60500f1, e47dbc8, 4470229, e341e1c, 3493cfa, 61889ae, 79992c7, bfda597, 2e7f230 | **Fork-only** (not code; never promoted) | `CLAUDE.md`, `docs/backlog.md`, `docs/brd-*.md`, `docs/upstream-sync.md`, `Taskfile.yml` |
-| D9 | ci/pre-commit ruff pin 0.16.6 | c285504 | **Upstreamed** (37e1415) | — |
+| D9 | ci/pre-commit ruff pin 0.16.6 | c285504 | **Upstreamed** (37e1415). The stale `uv.lock` follow-up is retired: the lock at `d439d1e` pins ruff 0.16.6. | — |
 
-## Collision recipes (as executed for 238ca21..8c4865f)
+## Collision recipes (as executed for 8c4865f..d439d1e)
 
 | C | File | Kind | Recipe as executed | Gotchas |
 | --- | --- | --- | --- | --- |
-| C1 | `mempalace/layers.py` | content | `git checkout --theirs`: take upstream's `_fetch_candidates` / `get_recent` whole. The fork's only layers change was D4. Then retarget `tests/test_l1_wake_up_fast_path.py` in its own commit (07d18f6): the mock gets `get_recent(*, limit, where, order_field, include)`, and the test asserts one call with `limit == MAX_SCAN`, `order_field == "filed_at"` and zero `get()` calls. | Upstream opens with `read_only=True`, so a `_get_collection` patch must accept `read_only`. A 2-arg lambda raises a TypeError that `generate()` swallows into "No palace found", making the guard silently vacuous; assert the output is not a failure header first. **qdrant cost:** qdrant has no `get_recent` override, so the base default pages `get()` in 500-row offset steps. L1 wake-up therefore scrolls about 5,000 rows where the fork did one 2,000-row get: bounded, but about 2.5× the rows, and the mock can't see it. See Follow-ups. |
-| C2 | `mempalace/miner.py` | content (`status()`) | Hand-resolve **only** the conflict hunk: HEAD side (facet block, then the fast path). The fast path is byte-identical on both sides, and the script asserted upstream's side is a suffix of ours. Verified with `git diff 8c4865f HEAD -- mempalace/miner.py` showing no removed lines. | Never `--ours` the whole file: that silently drops upstream's non-conflicting T7 miner hunks. |
-| C3 | `mempalace/palace.py` | modify/delete | `git rm` (upstream split it into the `mempalace/palace/` package). Then re-apply C9 in 3802060: add `_page_all_metadata_via_get` + `_iter_all_metadata` to `palace/mined.py`, and replace only the body of `_scan_all()` and `prefetch_content_hashes`'s count+offset loop. Upstream's `_absorb` / `_meta_is_current`, the `_PREFETCH_SCOPE_THRESHOLD` scoped `$in` get and its `groups.clear(); _scan_all()` fallback stay verbatim. | **Fragment exec (E15):** `palace/*.py` are exec'd into the `mempalace.palace` namespace, and `mined.py` raises ImportError if imported directly. Keep test imports and patch targets on `mempalace.palace`. **Chunker-version fixtures (E16):** upstream's `_meta_is_current` treats exchange rows without `convo_chunker_version >= CONVO_CHUNKER_VERSION` as stale, so fixture metadata must set it (legacy rows deliberately omit it). The legacy-algorithm oracles use `_meta_is_current`, not the bare `normalize_version` check. |
-| C4 | `tests/test_cli_status_fast_path.py` | add/add | First confirm upstream's test names (TestFastPath ×4, TestFallback ×2) are a subset of ours, then `git checkout --ours`. | — |
-| C5 | `tests/test_mcp_server.py` | modify/delete | `git rm` (upstream 7010a09 split it into `tests/mcp/`). Then move the 2 diary-hint tests verbatim into `tests/mcp/test_protocol.py::TestHandleRequest` (17bd277), placed before the next section comment so the formatter doesn't move it. | — |
+| C6 | `mempalace/palace/mined.py` | content, D5 | `git merge -X theirs` takes upstream's hunk in `_scan_all` and `prefetch_content_hashes`. Then `c74b4d2` sets `_paged_metadata` to `yield from _iter_all_metadata(collection)`, reverts the two auto-merged D5 docstring hunks to upstream's text, and retargets `TestPartialFetchSwallowPreserved` → `TestScrollFailureRaisesMinedSetUnavailable::test_scroll_failure_raises_mined_set_unavailable` (docstring point 5 too). | **Fragment exec:** `palace/*.py` are exec'd into `mempalace.palace`, so patch through `mempalace.palace`; upstream's raise test patches `mempalace.palace._paged_metadata`. Do not wrap the fallback in `try/except`. The legacy oracles already use `_meta_is_current`. **Recurs every sync (epic R7):** each #2684-family perf commit widens the Chroma/qdrant gap here. |
+| C7 | `integrations/openclaw/SKILL.md` | content, D6 | `-X theirs` takes upstream's `mempalace_search` line, and the D6 rule-4 sentence auto-merges. Then `a1b9297` deletes the 6 blank lines after tool-list `###` headings, leaving SKILL.md `1 1` against upstream. | `git checkout --theirs <file>` would drop the rule-4 sentence. |
 
-Auto-merged files that got a semantic review this sync: `backends/qdrant.py`, `mcp_server/schemas.py`, `mcp_server/tools_read.py`, `mcp_server/tools_diary.py`, `integrations/openclaw/SKILL.md`, `tests/conftest.py`, `CLAUDE.md`, `.github/workflows/ci.yml`. All intact.
+Recipes C1–C5 (238ca21..8c4865f) are in this file at 01be3cc.
+
+Auto-merged files that got a semantic review this sync: `schemas.py`, `tools_read.py`, `tools_diary.py`, `miner.py`, `tests/conftest.py`, `tests/mcp/test_protocol.py`. All intact.
+
+## Landing — never squash
+
+Last sync, `wt merge` squashed the sync branch into local develop as one
+commit, `f272411`, whose only parent was `79992c7` — that cut `8c4865f` out
+of develop's ancestry and would have made the next merge re-conflict in
+about 57 files. Develop was reset to the identical-tree unsquashed tip
+`01be3cc` (intent D1; local only, never pushed).
+
+Rule: land with `git merge --ff-only` or
+`wt merge --no-squash`, never a squash. Squashing this branch would cut
+`d439d1e` out of develop's history the same way.
 
 ## Promotion candidates
 
@@ -53,8 +65,11 @@ Each needs the owner's explicit say-so before any upstream PR:
 
 ## Follow-ups
 
-- **qdrant `get_recent` override** using `order_by filed_at`. It would bring L1 wake-up back to one bounded read (see C1: about 5,000 vs 2,000 rows) and give true newest-first rather than an insertion-order window.
-- **Stale `uv.lock` ruff pin upstream:** `pyproject.toml` pins `ruff==0.16.6` but `uv.lock` at 8c4865f pins 0.16.1. This sync ran with `UV_FROZEN=1`, so the lockfile stays byte-identical to upstream, and the local venv therefore runs ruff 0.16.1.
+- **qdrant `get_recent` override** using `order_by filed_at`. It would bring L1 wake-up back to one bounded read (see recipe C1 at 01be3cc: about 5,000 vs 2,000 rows) and give true newest-first rather than an insertion-order window.
+- **qdrant port of `prefetch_complete_mtimes`** via `get_all_metadata` (intent I8, BRD-P1). The project-mine skip check is still one `get(where=source_file)` per file on qdrant.
+- **T7 hook-output wording:** the stop hook now reports `drawers_filed` and `messages_folded` separately. Nothing is known to parse it.
+- **Coverage below pyproject's 85%** (pre-existing): BASE `01be3cc` measures 83.43%, this sync 83.99%, upstream CI gates at 80. Gated as no-regression (intent decision D7, not inv-D7).
+- **D5 Chroma fallback narrowing** (W1 tester P1): upstream's `_scan_collection_metadata` also calls `_paged_metadata` on Chroma after the fast scan fails. Now that it routes through `_iter_all_metadata` → `ChromaCollection.get_all_metadata()`, it retries the sqlite stream and pages via `get()` only on `sqlite3.Error`. Other errors (OSError, ValueError) raise `MinedSetUnavailable` where upstream paged; this is untested and qdrant is unaffected. Fix if D5 is promoted: route `ChromaCollection` inners to `_page_all_metadata_via_get`, and pin it with a RuntimeError fallback test.
 
 ## Retire the fork
 
