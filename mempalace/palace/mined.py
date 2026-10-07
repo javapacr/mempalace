@@ -112,14 +112,11 @@ def _scan_collection_metadata(collection, keys, absorb, reset, require_key=None)
 
 
 def _paged_metadata(collection):
-    total = collection.count()
-    offset = 0
-    while offset < total:
-        batch = collection.get(limit=1000, offset=offset, include=["metadatas"])
-        yield from batch["metadatas"]
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    """The non-Chroma fallback of :func:`_scan_collection_metadata`: one
+    :func:`_iter_all_metadata` pass (C9) instead of ``count()`` plus
+    ``get(limit, offset)`` pages, which re-scroll the collection from the
+    start on every page on materialize-then-slice backends (qdrant)."""
+    yield from _iter_all_metadata(collection)
 
 
 def file_already_mined(
@@ -294,18 +291,7 @@ def prefetch_mined_set(
     The convo miner walks thousands of transcript files; per-file
     `collection.get(where={"source_file": X})` costs ~2s on a 150k-drawer
     palace, making a 2000-file sweep take >1h of pure skip-checking. This
-    helper drops that to a single cursor pass plus O(1) lookups, fetched
-    via :meth:`collection.get_all_metadata` -- one continuous cursor walk
-    on backends that override it (qdrant, milvus, pgvector), the base
-    offset loop on backends with true server-side cursors (e.g. chroma).
-    Collections predating the contract method (a raw chromadb Collection)
-    fall back to the per-page `get(limit=, offset=)` loop these helpers
-    used before C9 -- still linear there, since such get() has a true
-    server-side cursor. Driving that loop unconditionally was O(n^2) on
-    materialize-then-slice backends -- every page re-walked the whole
-    collection just to discard everything outside its slice (see
-    docs/brd-p1-review-findings.md C9). The scoped path below is
-    unaffected: it is already a small filtered get.
+    helper drops that to a single paginated scan plus O(1) lookups.
 
     When `source_files` is given and holds at most `_PREFETCH_SCOPE_THRESHOLD`
     paths, the caller already knows the only source_file values that could
@@ -503,14 +489,6 @@ def prefetch_content_hashes(
     under_new_filename and test_mine_convos_skips_same_conversation_within_
     re_exported_bundle, which a source_files-scoped or skipped version of
     this function broke.
-
-    Like :func:`prefetch_mined_set`, the scan is a single cursor pass via
-    :meth:`collection.get_all_metadata` -- one continuous cursor walk on
-    backends that override it (qdrant, milvus, pgvector), the base offset
-    loop on backends with true server-side cursors (e.g. chroma), and the
-    per-page `get(limit=, offset=)` fallback for collections predating
-    the contract method. Driving that loop unconditionally was O(n^2) on
-    materialize-then-slice backends (see docs/brd-p1-review-findings.md C9).
     """
     hashes: dict[tuple[str, str], str] = {}
 

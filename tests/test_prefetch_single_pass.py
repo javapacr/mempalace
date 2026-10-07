@@ -30,10 +30,11 @@ Covers:
   4. Semantics preservation: the rewrite returns byte-for-byte the same
      result as a verbatim copy of the legacy count()+offset-loop
      algorithm over a mixed corpus on an honestly-paged collection.
-  5. Partial-fetch swallow preserved: a scroll failure mid-pass must not
-     raise out of the helpers -- they log a warning and return whatever
-     was accumulated (an empty dict on the qdrant path, where the whole
-     list is built inside get_all_metadata()).
+  5. No partial registry: a scroll failure mid-pass raises
+     MinedSetUnavailable out of both helpers (upstream's #2684 contract,
+     adopted on qdrant at the d439d1e sync) instead of returning whatever
+     was accumulated -- a partial dict reads as "not mined" / "no
+     duplicate" and would let a mine re-file blind.
 """
 
 import logging
@@ -112,6 +113,7 @@ from mempalace.palace import (  # noqa: E402
     _PREFETCH_SCOPE_THRESHOLD,
     CONVO_CHUNKER_VERSION,
     NORMALIZE_VERSION,
+    MinedSetUnavailable,
     _meta_is_current,
     _metadata_matches_extract_mode,
     prefetch_content_hashes,
@@ -851,29 +853,22 @@ class TestSemanticsPreservedVsLegacyAlgorithm:
 
 
 # ---------------------------------------------------------------------------
-# 5. Partial-fetch swallow preserved
+# 5. No partial registry: a mid-scroll failure raises MinedSetUnavailable
 # ---------------------------------------------------------------------------
 
 
-class TestPartialFetchSwallowPreserved:
-    """The prefetch helpers' `except Exception: logger.warning(...)` swallow
-    is load-bearing (a later manifest feature depends on partial results not
-    raising): a scroll failure mid-pass must surface as a warning + whatever
-    result was accumulated -- never an exception out of the helper. On the
-    qdrant path the whole list is now built inside get_all_metadata(), so a
-    raise mid-scroll yields an empty dict plus the warning."""
+class TestScrollFailureRaisesMinedSetUnavailable:
+    """Upstream's #2684 contract, adopted on qdrant at the d439d1e sync: a
+    scroll failure mid-pass must not yield a partial registry -- it reads
+    as "not mined" / "no duplicate", indistinguishable from a complete
+    answer -- so both helpers raise MinedSetUnavailable instead."""
 
     @pytest.mark.parametrize(
-        ("prefetch_fn", "warning_fragment"),
-        [
-            (prefetch_mined_set, "prefetch_mined_set: partial fetch"),
-            (prefetch_content_hashes, "prefetch_content_hashes: partial fetch"),
-        ],
+        "prefetch_fn",
+        [prefetch_mined_set, prefetch_content_hashes],
         ids=["mined_set", "content_hashes"],
     )
-    def test_scroll_failure_returns_partial_dict_with_warning(
-        self, monkeypatch, caplog, prefetch_fn, warning_fragment
-    ):
+    def test_scroll_failure_raises_mined_set_unavailable(self, monkeypatch, prefetch_fn):
         good_page = (
             [
                 _fake_point(
@@ -897,11 +892,9 @@ class TestPartialFetchSwallowPreserved:
         # a plain function works because _scroll_all() only ever calls it.
         setattr(col._client, "scroll_points", raise_on_second_page)
 
-        with caplog.at_level(logging.WARNING, logger="mempalace_mcp"):
-            result = prefetch_fn(col, extract_mode="exchange")  # must not raise
-
-        assert result == {}
-        assert warning_fragment in caplog.text
+        with pytest.raises(MinedSetUnavailable):
+            prefetch_fn(col, extract_mode="exchange")
+        assert len(call_log) == 2, "the failing pass must be the single pass"
 
 
 # ---------------------------------------------------------------------------
