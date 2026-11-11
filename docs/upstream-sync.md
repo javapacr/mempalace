@@ -98,6 +98,14 @@ Each needs the owner's explicit say-so before any upstream PR:
 - **T7 hook-output wording:** the stop hook now reports `drawers_filed` and `messages_folded` separately. Nothing is known to parse it.
 - **Coverage gate** is single-sourced in pyproject (`fail_under = 85`, `precision = 2`, applied by `tests/coverage_gate.py`); this sync gates each stack commit as no-regression vs UP (88.10%).
 - **Unindexed bookkeeping filters:** D3's subtraction filters on `metadata.ingest_mode` and `metadata.is_sentinel`, which have no payload index. A qdrant server that rejects unindexed filters sends `status` to the full scan with its "facet aggregation unavailable" warning.
+- **Keep-or-retire evidence (deferred 2026-11-11 by the owner):** re-read the live payload indexes, time `status` with an A/B against upstream, check D7 for leaks, and give every D-item a keep / move / drop verdict. No "Retirement evidence" section exists yet.
+- **Tester findings deferred from the f8e3536 sync:**
+  - D4: the failure-header list lacks "Palace could not be read right now"; the mock `where` lacks `$in`; the `(RuntimeError)` pin can flake to `TimeoutError` under load.
+  - No automated guard test for D7's `XDG_CONFIG_HOME` scrub.
+  - Split the legacy-sentinel divergence into its own test.
+  - Cover the room re-sort tie, and the end-to-end 400 failure on a real `QdrantCollection`.
+- **Subagent direct-tool selectors vs the tracked `.mcp.json`:** the tracked `.mcp.json` redefines the user-level `mempalace` server. pi-subagents replaces the user entry with it while pi-mcp-adapter 7 merges per field, so their config hashes differ and child agents that select `mempalace/*` direct tools fail to launch. Fix upstream in pi-subagents, or drop or rename the server in `.mcp.json` (an unsandboxed edit).
+- **Sandbox:** `ps` is blocked, so `tests/test_daemon.py::test_process_start_time_fallback_readers_without_psutil` fails when run alone in the sandbox; it passes in full runs.
 
 ## Retire the fork
 
